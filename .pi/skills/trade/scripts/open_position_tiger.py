@@ -290,7 +290,9 @@ def main():
     # 三连败后仍开第 4 笔的首次盘中漏执行、机械堵漏）。模拟盘不拦（2026-09-14 用户
     # 裁定：模拟盘是修整验证场，与熔断闸同作用域）。次日自动放行；--force = 用户决策覆盖。
     _ls_forced = False
-    _ls_ok, _ls_detail = U.check_losing_streak_gate(account=account)
+    # 「当日」按 HKT 交易日算（market="HK"，2026-11-15 T197US）：HKT 与北京同时区，
+    # 结果与原实现一致；显式传参只为与美股版统一口径（不能依赖本机时区）。
+    _ls_ok, _ls_detail = U.check_losing_streak_gate(account=account, market="HK")
     if not _ls_ok:
         if force:
             print("⚠️ 一级降频线已触发，--force 用户决策覆盖——放行开仓")
