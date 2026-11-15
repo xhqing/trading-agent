@@ -86,6 +86,20 @@ def market_today(market=None, ts_ms=None):
     return datetime.fromtimestamp(int(ts_ms) / 1000, tz).strftime("%Y-%m-%d")
 
 
+def market_date_of(market=None, dt=None):
+    """把一个具体时刻换算成**该市场的交易日** 'YYYY-MM-DD'（dt 缺省 = 现在）。
+
+    与 `market_today` 同一套口径，区别只在入参形态：`market_today` 收毫秒时间戳，
+    本函数收 datetime（便于比较「某笔成交发生在哪个市场的哪个交易日」）。
+    dt 无时区信息时按本机时区解释——`datetime.now()` 产出的就是本机墙钟，
+    旧版连败文件里的 `updated_at` 也是本机墙钟，两者都要能正确还原成绝对时刻。
+    """
+    now = dt if dt is not None else datetime.now()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    return now.astimezone(market_tz(market)).strftime("%Y-%m-%d")
+
+
 def order_market(o):
     """判定一条订单属于哪个市场：优先币种（HKD→hk、USD→us），缺失时按代码形态兜底
     （港股 5 位数字代码、美股字母代码）。返回 'hk' / 'us'（无法判定时按 'us'）。
@@ -2312,6 +2326,14 @@ def update_losing_streak(market, symbol, direction, entry_price, stop_dist,
     盈利（R>0）清零连败；亏损（R≤0，含微亏）连败 +1 并把 R 追加进 recent_r（保留最近 5 笔）。
     entry_price / stop_dist / quantity 任一缺失 → 无法算 R：文件不动、返回 skipped 原因
     （连败计数宁可漏记不可误记——漏记由补记流程 / 复盘对账兜底，误记会错拦开仓）。
+    日期口径（2026-11-15 T197US 修）：落盘的 `date` 是**该笔亏损所属市场的交易日**——
+    美股取美东日期（ET）、港股取本机（HKT/北京）日期，与项目「时间判断统一以 ET 为
+    权威口径」（2026-11-05 立）一致。原有实现取本机北京日期，导致美股「当日」在 ET 11:00
+    （北京零点）就翻篇：盘中止损后 5 小时内闸门提前放行、下一场前 1.5 小时又被误拦。
+    同时落 `loss_ts_ms`（绝对时刻）与 `date_tz`（date 用的是哪个时区的交易日），
+    供 `check_losing_streak_gate` 换算「要开仓的那个市场」的交易日（跨市场场景必须按
+    绝对时刻换时区才有确定答案）。
+
     任何内部异常不抛出（不阻断平仓结果输出，与 attach_net_pnl_app 同哲学）。
 
     close_order_id（2026-09-18 立，T151 被动平仓自动补记的去重键）：平仓成交单的订单
@@ -2344,7 +2366,8 @@ def update_losing_streak(market, symbol, direction, entry_price, stop_dist,
             basis = "estimate（fee_schedule 估净利 ÷ 净 max_loss——net_pnl 缺失时兜底）"
         r = round(r, 3)
 
-        today = datetime.now().strftime("%Y-%m-%d")
+        now = datetime.now().astimezone()          # 带时区的绝对时刻（落 loss_ts_ms 用）
+        today = market_date_of(market, now)        # 该笔亏损所属市场的交易日（US=ET、HK=HKT）
         state = {}
         try:
             state = json.load(open(_losing_streak_path()))
@@ -2366,8 +2389,11 @@ def update_losing_streak(market, symbol, direction, entry_price, stop_dist,
             recent_r.append(r)
             recent_r = recent_r[-5:]
         new_state = {
-            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at_et": now.astimezone(ET_TZ).strftime("%Y-%m-%d %H:%M:%S"),
             "date": today,
+            "date_tz": "ET" if market_tz(market) is ET_TZ else "HKT",
+            "loss_ts_ms": int(now.timestamp() * 1000),
             "market": market, "symbol": symbol,
             "streak": streak, "recent_r": recent_r,
             "recorded_close_ids": recorded_ids,
@@ -2393,25 +2419,65 @@ def _losing_streak_triggered(state):
     return False
 
 
-def check_losing_streak_gate(account=None, now=None):
-    """开仓前置闸（2026-08-31 T131；2026-09-14 用户裁定作用域改实盘）：读连败文件判一级
-    降频线是否当日触发。
+def _last_loss_market_date(state, market):
+    """最近一笔亏损换算成 **market 市场的交易日**（'YYYY-MM-DD'）；换算不出时返回 None。
+
+    为什么要换算而不是直接比 `state['date']`（2026-11-15 T197US）：连败计数是账户口径、
+    港美共用一条序列（美股夜盘亏完接着港股早盘开盘是真实场景），而 `date` 记的是
+    **那笔亏损所属市场**的交易日。拿它直接与「现在要开仓的市场」的交易日比，等于拿 ET 日期
+    与 HKT 日期对同一把尺——两个时区的自然日根本不可比。正确做法：把亏损的**绝对时刻**
+    换算到要开仓市场的时区取日期，再和该市场的今日比。
+
+    换算优先级：`loss_ts_ms`（绝对时刻，2026-11-15 起写入）→ `updated_at`（本机墙钟，
+    旧文件也有）→ 直接返回 `date` 字面值（旧口径兜底：HK 准确，US 可能偏差 1 天，
+    下次亏损写入后自动修正）。
+    """
+    ts = state.get("loss_ts_ms")
+    try:
+        if ts is not None and float(ts) > 0:
+            return market_date_of(market, datetime.fromtimestamp(float(ts) / 1000))
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    updated = state.get("updated_at")
+    if updated:
+        try:
+            return market_date_of(market, datetime.strptime(str(updated), "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+    return state.get("date") or None
+
+
+def check_losing_streak_gate(account=None, market=None, now=None):
+    """开仓前置闸（2026-08-31 T131；2026-09-14 作用域改实盘）：读连败文件判一级降频线
+    是否当日触发。
 
     返回 (allowed: bool, detail: str_or_None)。拦 = 账户为实盘（account=='live'）**且**
-    连败达标（≥3 或 ≥2 且最近两笔亏满型）**且**最近一笔亏损平仓发生在今日（date == 今日；
-    「次日再战」= 次日自动放行）。模拟盘不拦（2026-09-14 用户裁定：模拟盘是修整验证场、
+    连败达标（≥3 或 ≥2 且最近两笔亏满型）**且**最近一笔亏损与本次开仓属于**同一个交易日**
+    （「次日再战」= 次日自动放行）。模拟盘不拦（2026-09-14 用户裁定：模拟盘是修整验证场、
     不受降频线约束——与实盘熔断闸同作用域哲学）。文件不存在 / 损坏 / 连败未达标 /
     最近亏损非今日 / 非实盘账户 → 放行（detail=None 静默，非实盘触发时 detail 给提示性
-    说明但 allowed=True）。港美共用一把闸（规则不分市场——账户口径的连败序列）。
+    说明但 allowed=True）。港美共用一把闸（连败序列是账户口径、不按市场分开计）。
+
+    **「当日」按哪个市场的交易日算（2026-11-15 T197US 修）**：按 `market` 参数（要开仓的
+    市场）——US 取美东交易日（ET）、HK 取 HKT 交易日。此前两边都用本机北京日期，而美股
+    一个 ET 交易日横跨北京零点（ET 11:00 = 北京 00:00，离收盘还有 5 小时），于是 ① 盘中止损后
+    北京一换日就提前放行、② 下一场开盘头 1.5 小时（北京 22:30-23:59 仍在「北京当日」内）
+    被误拦。跨市场时把亏损的绝对时刻换算到 `market` 时区取日期再比（见 `_last_loss_market_date`），
+    所以「美股夜盘亏损 → 次晨港股开盘」仍算同一日被拦（亏损时刻换算到 HKT 已跨到次日、
+    与港股当日相等），而「美股亏损 → 次日美股」不再误拦。
+    `market` 不传时退回文件里的 `market` 字段（那笔亏损所属市场）、再退默认美股。
     """
     from datetime import datetime
     import json
+    now_dt = now or datetime.now()
     if account != "live":
         # 模拟盘 / 默认（未显式传账户 = 模拟盘口径）不受一级降频线约束。触发态仍返回
         # 提示信息（在场打印、供 AI 转录留痕），但不拦单。
         try:
             state = json.load(open(_losing_streak_path()))
-            if _losing_streak_triggered(state) and state.get("date") == (now or datetime.now()).strftime("%Y-%m-%d"):
+            mkt = market or state.get("market") or "us"
+            if (_losing_streak_triggered(state)
+                    and _last_loss_market_date(state, mkt) == market_date_of(mkt, now_dt)):
                 return True, (f"一级降频线今日已触发（连败 {state.get('streak')} 笔）——"
                               f"2026-09-14 用户裁定模拟盘不受约束、照常开仓；实盘开仓仍被拦（次日自动放行）。")
         except Exception:
@@ -2423,16 +2489,21 @@ def check_losing_streak_gate(account=None, now=None):
         return True, None
     if not _losing_streak_triggered(state):
         return True, None
-    today = (now or datetime.now()).strftime("%Y-%m-%d")
-    if state.get("date") != today:
-        return True, None   # 最近一笔亏损在昨日或更早：次日再战，放行（今日再亏会重新触发）
+    mkt = market or state.get("market") or "us"
+    today = market_date_of(mkt, now_dt)
+    loss_day = _last_loss_market_date(state, mkt)
+    if loss_day != today:
+        return True, None   # 最近一笔亏损在上一交易日或更早：次日再战，放行（今日再亏会重新触发）
     streak = int(state.get("streak", 0) or 0)
     recent_r = list(state.get("recent_r", []) or [])
     reason = (f"连败 {streak} 笔" if streak >= 3
               else f"连败 {streak} 笔且最近两笔都亏满型（净 R {recent_r[-2:]}，均 ≤ {FULL_LOSS_R}）")
-    detail = (f"一级降频线触发（{reason}，最近序列 {recent_r}）——按 review-and-evaluation.md"
+    tz_name = "ET" if market_tz(mkt) is ET_TZ else "HKT"
+    detail = (f"一级降频线触发（{reason}，最近序列 {recent_r}；最近亏损成交于 {tz_name} {loss_day}，"
+              f"与本次开仓同属 {tz_name} 交易日 {today}）——按 review-and-evaluation.md"
               f"「一级·降频线」当日停止开新仓、次日再战（2026-09-14 用户裁定：作用域 = 实盘开仓，"
-              f"模拟盘照常）。此为 2026-08-28 三连败后仍开第 4 笔漏执行的机械堵漏；确需强开须"
+              f"模拟盘照常；「当日」按被交易市场的交易日算，美股 = ET、港股 = HKT，2026-11-15 T197US）。"
+              f"此为 2026-08-28 三连败后仍开第 4 笔漏执行的机械堵漏；确需强开须"
               f"用户决策（--force 覆盖）。")
     return False, detail
 

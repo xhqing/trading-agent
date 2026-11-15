@@ -22,6 +22,10 @@ AI 按 K 线推定成交价后跑本脚本。不补则连败漏记、降频闸�
                 共用去重键，同一订单只计一次连败
 
 输出 JSON：{r_multiple, r_basis, streak, recent_r, gate_triggered_today}。
+
+日期口径（2026-11-15 T197US）：写入的 `date` 是**该笔亏损所属市场的交易日**（US 取美东日期、
+HK 取 HKT 日期），不是本机北京日期；同时写 `loss_ts_ms`（绝对时刻）与 `date_tz`。本节
+CLI 的 market 参数（HK / US）就是日期口径的依据，不要传错——传错会让连败闸的「当日」判错。
 """
 
 import json

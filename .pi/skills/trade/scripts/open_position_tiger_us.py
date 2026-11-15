@@ -181,7 +181,10 @@ def main():
     # 且最近一笔亏损平仓发生在今日 → 实盘当日停止开新仓；模拟盘不拦（2026-09-14
     # 用户裁定：模拟盘是修整验证场，与熔断闸同作用域）。次日自动放行；--force = 用户决策覆盖。
     _ls_forced = False
-    _ls_ok, _ls_detail = T.check_losing_streak_gate(account=account)
+    # 「当日」按美东交易日算（market="US"，2026-11-15 T197US）：原先取本机北京日期，
+    # 美股盘中卖北京零点（= ET 11:00，离收盘还有 5 小时）就提前放行、下一场开盘头
+    # 1.5 小时又被误拦——「当日」必须取被交易市场的交易日。
+    _ls_ok, _ls_detail = T.check_losing_streak_gate(account=account, market="US")
     if not _ls_ok:
         if force:
             print("⚠️ 一级降频线已触发，--force 用户决策覆盖——放行开仓")
