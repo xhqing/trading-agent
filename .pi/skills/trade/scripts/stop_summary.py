@@ -961,6 +961,22 @@ def main():
             print((r.stdout or r.stderr).strip()[-300:])
     else:
         print("ℹ️ 未传 --fx：token 费用未记账（需 CNY/USD 实值，勿估算）")
+
+    # 5) 停盯收尾显式停掉多端口池 xray（T193，2026-11-13 立）
+    # 为什么要在这里停：多端口池是为「盘中快速换出口」起的常驻进程，停盯后没有任何用途；
+    # 不显式停就会跟着会话一起变成孤儿——旧版 pid 文件在 worktree 的 tmp/ 里，会话结束 /
+    # worktree 删除后 pid 文件跟着消失，stop_multi() 再也没机会被调用（2026-11-13 实测
+    # 本机 10 个孤儿实例、每个都在 10871-10886 上监听，请求被随机分发到旧节点）。
+    # 失败不影响收尾（收尾标记与飞书都已落盘，这条只是资源清理）。
+    try:
+        import ip_pool as _IP
+        if _IP.multi_running():
+            _IP.stop_multi()
+            print("🧹 多端口池 xray 已停（停盯收尾「T193）")
+        else:
+            print("ℹ️ 多端口池 xray 未运行（无需清理）")
+    except Exception as _e:
+        print(f"⚠️ 多端口池清理跳过（{_e}）——`python3 scripts/ip_pool.py --multi-stop` 手动确认")
     return 0
 
 
