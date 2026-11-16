@@ -293,6 +293,8 @@ def main():
     # 「当日」按 HKT 交易日算（market="HK"，2026-11-15 T197US）：HKT 与北京同时区，
     # 结果与原实现一致；显式传参只为与美股版统一口径（不能依赖本机时区）。
     _ls_ok, _ls_detail = U.check_losing_streak_gate(account=account, market="HK")
+    # T199：同一套判据算「若这是实盘会不会被拦」（模拟盘路径用来打标注，实盘路径不重复拦）
+    _ls_would_block, _ls_would_block_detail = U.losing_streak_would_block(market="HK")
     if not _ls_ok:
         if force:
             print("⚠️ 一级降频线已触发，--force 用户决策覆盖——放行开仓")
@@ -401,6 +403,16 @@ def main():
     }
     if _ls_forced:
         result_base["losing_streak_forced"] = True   # T131：降频线触发但 --force 用户覆盖
+    # T199（2026-11-16 立）：模拟盘不受闸约束，但必须**逐笔标注「若这是实盘会不会被拦」**——
+    # 样本策略与部署策略的差异要可量化：复盘据此把「无闸样本」重放成「按实盘规则」的口径
+    # （EV 双报见 scripts/ev_dual_report.py），样本量不降、口径可切换。
+    if _ls_would_block and account != "live":
+        result_base["would_block_by"] = "losing_streak"
+        result_base["would_block_detail"] = _ls_would_block_detail
+        result_base["warning"] = ((result_base.get("warning") + "；")
+                                  if result_base.get("warning") else "") + (
+            "⚠️ 本笔若按实盘规则会被一级降频线拦下（would_block_by=losing_streak）——"
+            "模拟盘照常成交（2026-09-14 用户裁定），actions 记录必须带上该字段（T199 双轨标注）")
     # 自动算仓位的落档信息（在费上下文/校验之后写进 result，拒单报错里也带上真实股数与赔率）
     if lot_size is not None:
         result_base.update({"auto_sized": True, "equity": equity, "equity_currency": currency,
@@ -982,6 +994,13 @@ def main():
     # = 工具强制（auto 模式用户若不盯屏幕感知不到开仓；记录写 ring-log-auto.csv 与
     # signal 隔离，见 U.ring_after_fill docstring）。
     U.ring_after_fill("HK", symbol, note=f"auto成交{result_base['quantity']}股@{fill_price}")
+    # T199（2026-11-16 立）：实盘滑点校准——头 20~30 笔记录
+    # slip_R = |实际成交价 − 决策参考价| ÷ 止损距，把「paper = 决策时刻价、无滑点」
+    # 这个口径差补上（复盘 EV 与实盘期望之间的第二个系统性差异源，第一个是连败闸）。
+    _stop_dist = abs(entry_ref - stop_loss)
+    if _stop_dist > 0 and fill_price is not None:
+        result_base["slip_R"] = round(abs(float(fill_price) - entry_ref) / _stop_dist, 4)
+        result_base["slip_basis"] = "|实际成交价 − 决策参考价| ÷ 止损距（T199 滑点校准口径）"
     # T191HKUS：成交即把初始止损钉进 state/，平仓 R 分母只认这一份（移损不改基准）
     import stop_basis
     stop_basis.record("HK", symbol, fill_price, stop_loss,

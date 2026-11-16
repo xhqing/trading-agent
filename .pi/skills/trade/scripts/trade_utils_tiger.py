@@ -2470,30 +2470,52 @@ def check_losing_streak_gate(account=None, market=None, now=None):
     from datetime import datetime
     import json
     now_dt = now or datetime.now()
+    _wb, _detail = losing_streak_would_block(market=market, now=now_dt)
     if account != "live":
         # 模拟盘 / 默认（未显式传账户 = 模拟盘口径）不受一级降频线约束。触发态仍返回
         # 提示信息（在场打印、供 AI 转录留痕），但不拦单。
-        try:
-            state = json.load(open(_losing_streak_path()))
-            mkt = market or state.get("market") or "us"
-            if (_losing_streak_triggered(state)
-                    and _last_loss_market_date(state, mkt) == market_date_of(mkt, now_dt)):
-                return True, (f"一级降频线今日已触发（连败 {state.get('streak')} 笔）——"
-                              f"2026-09-14 用户裁定模拟盘不受约束、照常开仓；实盘开仓仍被拦（次日自动放行）。")
-        except Exception:
-            pass
+        if _wb:
+            try:
+                state = json.load(open(_losing_streak_path()))
+            except Exception:
+                state = {}
+            return True, (f"一级降频线今日已触发（连败 {state.get('streak')} 笔）——"
+                          f"2026-09-14 用户裁定模拟盘不受约束、照常开仓；实盘开仓仍被拦（次日自动放行）。")
         return True, None
+    if not _wb:
+        return True, None
+    return False, _detail
+
+
+def losing_streak_would_block(market=None, now=None):
+    """把「一级降频线此刻是否触发」从账户作用域里剥出来（T199，2026-11-16 立）。
+
+    返回 (would_block: bool, detail: str|None)：**不看 account**，只回答「按当前连败状态 +
+    本条要开仓的市场交易日，若这是实盘，会不会被拦」。两个调用方共用同一套判据：
+      ① `check_losing_streak_gate`——实盘真拦 / 模拟盘只提示；
+      ② 开仓脚本的模拟盘路径（`open_position_tiger*.py`）——把 `would_block_by:
+         losing_streak` 记进结果，供 AI 转录到 actions 记录（T199 双轨的「逐笔标注」轨）。
+    为什么必须共用一份：样本策略要能对得上部署策略，前提是「假如我是实盘，这笔会不会被拦」
+    与实际拦单用**完全同一个判据**算——两边各写一套，口径一飘就白标注了。
+
+    「同交易日」按被交易市场的交易日算（market='us' → ET），最近一笔亏损取绝对时刻换算到
+    该市场时区（`_last_loss_market_date`），与 T197US 口径一致。
+    """
+    from datetime import datetime
+    import json
+    now_dt = now or datetime.now()
     try:
         state = json.load(open(_losing_streak_path()))
     except Exception:
-        return True, None
+        return False, None
     if not _losing_streak_triggered(state):
-        return True, None
+        return False, None
     mkt = market or state.get("market") or "us"
     today = market_date_of(mkt, now_dt)
     loss_day = _last_loss_market_date(state, mkt)
     if loss_day != today:
-        return True, None   # 最近一笔亏损在上一交易日或更早：次日再战，放行（今日再亏会重新触发）
+        # 最近一笔亏损在上一交易日或更早：次日再战，放行（今日再亏会重新触发）
+        return False, None
     streak = int(state.get("streak", 0) or 0)
     recent_r = list(state.get("recent_r", []) or [])
     reason = (f"连败 {streak} 笔" if streak >= 3
@@ -2505,7 +2527,7 @@ def check_losing_streak_gate(account=None, market=None, now=None):
               f"模拟盘照常；「当日」按被交易市场的交易日算，美股 = ET、港股 = HKT，2026-11-15 T197US）。"
               f"此为 2026-08-28 三连败后仍开第 4 笔漏执行的机械堵漏；确需强开须"
               f"用户决策（--force 覆盖）。")
-    return False, detail
+    return True, detail
 
 
 def mark_session_market(market, stag=None):
