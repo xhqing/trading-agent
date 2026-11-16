@@ -486,6 +486,67 @@ def monitor_segment_running(now=None):
         return False, f"检查异常 {e}"
 
 
+def _market_today(market):
+    """该市场的「今日」交易日 'YYYY-MM-DD'（T198）：美股取美东日期，港股取本机（HKT/北京）
+    日期。与 `pool_claim._today_for` / `trade_utils_tiger.market_today` 同口径——美股一个
+    ET 交易日横跨北京零点，拿本机日期判「是不是当日」会在北京 00:00 把前半场认领当成
+    隔日残留。
+    """
+    if str(market).lower() == "us":
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _claim_market_of(c):
+    """认领条目属于哪个市场：显式 `market` 优先，否则按标的前缀推断（同 pool_claim 口径）。"""
+    m = str(c.get("market") or "").lower()
+    if m in ("hk", "us"):
+        return m
+    return "hk" if any(str(s).startswith("HK.") for s in (c.get("symbols") or [])) else "us"
+
+
+def _claims_current(sid=None):
+    """读 `state/pool_claims.json`，返回**在自身市场当日有效**的认领条目（T198，2026-11-15 立）。
+
+    认领表按「市场 + 市场交易日」分桶：每条认领自带 `market`（hk / us）与 `date`
+    （美股 ET 交易日、港股 HKT/北京日期）；旧版单桶形态（顶层 `date`、条目无 `market`）
+    在此补齐兼容。**原实现一律拿「顶层 date == 北京今天」比对**——美股一个 ET 交易日
+    横跨北京零点（ET 11:00 = 北京次日 00:00），过零点后整表被判隔日残留：跨池冲突检查
+    直接放行、`session_market` 与「本会话是不是盯盘会话」同步失明，互斥实际只覆盖到
+    前半场。
+
+    sid 给定时只返回该会话的条目。认领表缺失 / 损坏 → 空列表（钩子不因文件异常误拦）。
+    """
+    path = os.path.join(STATE_DIR, "pool_claims.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    legacy_date = data.get("date")
+    out = []
+    for raw in data.get("claims", []):
+        if not isinstance(raw, dict):
+            continue
+        if sid is not None and raw.get("session") != sid:
+            continue
+        mk = _claim_market_of(raw)
+        dt = raw.get("date") or legacy_date
+        if dt != _market_today(mk):
+            continue   # 别的交易日（或隔日残留）的认领不占坑
+        c = dict(raw)
+        c["market"] = mk
+        c["date"] = dt
+        out.append(c)
+    return out
+
+
 def _pool_conflict(exec_seg_cmds, sid=""):
     """标的池互斥检测（2026-08-19 立；2026-08-20 修管道绕过 + 扩三层语义）。
 
@@ -512,15 +573,7 @@ def _pool_conflict(exec_seg_cmds, sid=""):
     claims_path = os.path.join(STATE_DIR, "pool_claims.json")
     if not os.path.isfile(claims_path):
         return None   # 无认领表文件：不拦（认领制未启用）
-    try:
-        import datetime as _dt
-        with open(claims_path) as f:
-            data = json.load(f)
-        if data.get("date") != _dt.datetime.now().strftime("%Y-%m-%d"):
-            return None   # 非当日认领（跨日残留）：不拦
-        claims_list = data.get("claims", [])
-    except Exception:
-        return None   # 认领表读坏：宁可放行（互斥闸另有兜底），不当普通采样拦死
+    claims_list = _claims_current()   # T198：按「市场 + 市场交易日」过滤（旧版单桶形态自动兼容）
 
     taken = {}          # symbol -> 持有会话 sid
     alive_claims = []
@@ -667,20 +720,11 @@ def session_market(sid):
                 return mk
     except Exception:
         pass
-    # ③ 当日认领表（港股池概念）
+    # ③ 当日认领表（T198：按市场分桶，美股取 ET 交易日、港股取本机日期）
     try:
-        claims = os.path.join(STATE_DIR, "pool_claims.json")
-        if os.path.isfile(claims):
-            with open(claims) as f:
-                data = json.load(f)
-            if data.get("date") == today:
-                for c in data.get("claims", []):
-                    if c.get("session") == sid:
-                        sym = str(c.get("symbol") or "")
-                        if sym.startswith("US."):
-                            return "US"
-                        if sym.startswith("HK."):
-                            return "HK"
+        mine_claims = _claims_current(sid)
+        if mine_claims:
+            return "US" if _claim_market_of(mine_claims[0]) == "us" else "HK"
     except Exception:
         pass
     # ④ 港股盯盘注册表
@@ -758,17 +802,12 @@ def _is_monitoring_session(sid):
                         return True
             except OSError:
                 pass
-        # ② 当日认领表
-        claims = os.path.join(STATE_DIR, "pool_claims.json")
-        if os.path.isfile(claims):
-            try:
-                with open(claims) as f:
-                    data = json.load(f)
-                if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
-                    if any(c.get("session") == sid for c in data.get("claims", [])):
-                        return True
-            except Exception:
-                pass
+        # ② 当日认领表（T198：按市场分桶，每条只看自己市场的当日有效性）
+        try:
+            if _claims_current(sid):
+                return True
+        except Exception:
+            pass
         # ③ 当日开仓 intent
         # T142（2026-09-09）：判③只进不出——开过仓的会话即便走完停盯流程（注销注册表、
         # 释放认领），intent 行仍永久命中，已合法喊停的会话每个回合结束都被本提醒再拉起
