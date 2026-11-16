@@ -9,10 +9,17 @@
   里「认领」一段未占用的标的；后启动的会话认领剩下的；死会话（崩溃 / 忘注销）的标的
   自动释放回候选池。天然支持会话数动态变化。
 
-数据文件：state/pool_claims.json（当天有效；跨日自动重置——每条认领带日期，读时只认
-  当日条目，昨日残留不占坑）。结构：
-  {"date": "YYYY-MM-DD", "claims": [{"session": "<sid>", "symbols": ["HK.00700", ...],
-    "ts": "HH:MM:SS"}, ...]}
+数据文件：state/pool_claims.json（**按「市场 + 市场交易日」分桶**，桶内当日有效；其它市场 /
+  其它交易日的桶互不影响）。T198（2026-11-15 立）：原表只有一个顶层 `date` 桶、且按本机
+  （北京）日期判「是不是当日」——美股一个 ET 交易日横跨北京零点（ET 11:00 = 北京次日
+  00:00），一过零点整表被当成隔日残留作废：前半场认领清空、其它会话可自由认领同一标的、
+  monitor_guard 的跨池冲突检查同时失明（互斥实际只覆盖到 ET 11:00）。现在每条认领自带
+  `market`（hk / us）与 `date`（该市场的交易日：美股 ET、港股 HKT/北京），读写都按桶进行。
+  结构：
+  {"claims": [{"session": "<sid>", "symbols": ["HK.00700", ...], "ts": "HH:MM:SS",
+               "market": "hk" | "us", "date": "YYYY-MM-DD"}, ...]}
+  旧版单桶形态（{"date": ..., "claims": [...]}）读取时自动兼容：顶层日期当作每条认领的
+  日期、市场按标的前缀推断，下次写盘自然迁移成新形态。
 
 互斥保证 = flock 文件锁（同 trade_mutex 思路）：整个「检查占用 → 认领登记」临界区在
 锁内原子完成，两会话同时启动也不出双占。锁内同时做死会话清理（认领者顺手当清道夫）。
@@ -208,25 +215,75 @@ def _session_alive(sid):
     return age is not None and age <= DEAD_SESSION_SECONDS
 
 
-def _load_claims(today):
-    """读当日认领表；文件不存在 / 非当日 / 坏 JSON → 空表（昨日残留不占坑）。"""
+def _today_for(market):
+    """该市场的「今日」交易日 'YYYY-MM-DD'（T198）：美股取美东日期，港股取本机（HKT/北京）
+    日期。口径与 `trade_utils_tiger.market_today('us')` / `log_action.sh et` 同源——
+    美股 ET 交易日横跨北京零点，用本机日期会在北京 00:00 把前半场认领错当作废。
+    本脚本不 import trade_utils_tiger（它会拉进整个券商库），直接用 zoneinfo。
+    """
+    if str(market).lower() == "us":
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _claim_market(c):
+    """认领条目属于哪个市场：显式 `market` 优先，否则按标的前缀推断（有 HK. = 港股）。"""
+    m = str(c.get("market") or "").lower()
+    if m in ("hk", "us"):
+        return m
+    return "hk" if any(str(s).startswith("HK.") for s in (c.get("symbols") or [])) else "us"
+
+
+def _read_claims_file():
+    """读整份认领表（不做日期 / 市场过滤），返回 claims 列表；旧版单桶形态自动补齐字段。
+
+    旧版（2026-11-15 前）：{"date": "YYYY-MM-DD", "claims": [...]} —— 顶层一个日期桶、
+    覆盖全部市场。兼容处理：顶层日期当作每条认领的 `date`，`market` 按标的推断。
+    认领表缺失 / JSON 损坏 → 空列表（认领链路不因文件异常停摆）。
+    """
     if not os.path.exists(CLAIMS_FILE):
         return []
     try:
         with open(CLAIMS_FILE) as f:
             data = json.load(f)
-        if data.get("date") != today:
-            return []   # 跨日：昨日认领全部失效
-        return data.get("claims", [])
     except Exception:
         return []
+    legacy_date = data.get("date")
+    out = []
+    for raw in data.get("claims", []):
+        if not isinstance(raw, dict):
+            continue
+        c = dict(raw)
+        if not c.get("market"):
+            c["market"] = _claim_market(c)
+        if not c.get("date"):
+            c["date"] = legacy_date
+        out.append(c)
+    return out
 
 
-def _save_claims(today, claims):
+def _load_claims(market):
+    """读**该市场当前交易日**桶的认领；其它市场 / 其它交易日的一律不返回（各自独立成桶）。"""
+    today = _today_for(market)
+    return [c for c in _read_claims_file()
+            if _claim_market(c) == str(market).lower() and c.get("date") == today]
+
+
+def _save_claims(market, claims):
+    """把该市场当前交易日的桶整体替换，**其它市场的桶原样保留**（跨市场互不覆盖）。"""
+    market = str(market).lower()
+    today = _today_for(market)
+    keep = [c for c in _read_claims_file()
+            if not (_claim_market(c) == market and c.get("date") == today)]
+    out = keep + [dict(c, market=market, date=today) for c in claims]
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = CLAIMS_FILE + ".tmp"
     with open(tmp, "w") as f:
-        f.write(json.dumps({"date": today, "claims": claims}, ensure_ascii=False, indent=1))
+        f.write(json.dumps({"claims": out}, ensure_ascii=False, indent=1))
     os.replace(tmp, CLAIMS_FILE)
 
 
@@ -260,14 +317,15 @@ def _norm_sym(s):
 
 
 def _fmt_claims(claims):
-    """认领表 → 人读状态行。"""
+    """认领表 → 人读状态行（带市场标签：hk / us 的桶独立，同一份文件里可能同时有）。"""
     if not claims:
         return "（无认领——候选池全部空闲）"
     lines = []
     for i, c in enumerate(claims, 1):
         sid_short = c["session"][:8] if c["session"] else "?"
         syms = ", ".join(c["symbols"]) if c["symbols"] else "（空认领——仅放弃清单）"
-        lines.append(f"  会话{i} [{sid_short}…]: {syms}（认领于 {c['ts']}）")
+        mk = str(c.get("market") or _claim_market(c)).upper()
+        lines.append(f"  会话{i} [{sid_short}…] {mk}: {syms}（认领于 {c['ts']}）")
     return "\n".join(lines)
 
 
@@ -375,13 +433,21 @@ def cmd_claim(args):
         print("⚠️ 未拿到会话 ID（PI_SESSION_ID；非会话内跑？）——"
               "认领会记到 unknown，死会话判定失效；建议在盯盘会话内跑本命令", file=sys.stderr)
 
-    today = datetime.now().strftime("%Y-%m-%d")
     now_t = datetime.now().strftime("%H:%M:%S")
+    # 认领表按「市场 + 市场交易日」分桶（T198）：一次 claim 只能属一个市场。
+    # 混市场认领是没实际场景的用法（一个会话盯一个市场），直接拒掉而不默默丢标的。
+    _hk_want = [s for s in want if s.startswith("HK.")]
+    if _hk_want and len(_hk_want) != len(want):
+        print("⛔ 认领表按「市场 + 交易日」分桶，不能把港股与美股标的混在一次 claim 里——"
+              "请分两次执行（如 `claim HK.00700,HK.00981` 与 `claim US.MU`）", file=sys.stderr)
+        return 2
+    market = "hk" if _hk_want else "us"
+    today = _today_for(market)   # 美股用 ET 交易日、港股用本机日期（跨零点不丢认领）
     # ETF 优先认领闸要的类型判定（锁外先算好，锁内只做判定不做 IO）
     got_types = {}
     with open(LOCK_FILE, "a") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        claims, released = _prune_dead(_load_claims(today))
+        claims, released = _prune_dead(_load_claims(market))
         if released:
             for r_sid, r_syms in released:
                 print(f"🧹 已释放死会话认领：[{r_sid[:8]}…] 的 {', '.join(r_syms)}")
@@ -448,8 +514,9 @@ def cmd_claim(args):
                 mine["symbols"] = new_syms
                 mine["ts"] = now_t
             else:
-                claims.append({"session": sid or "unknown", "symbols": got, "ts": now_t})
-        _save_claims(today, claims)
+                claims.append({"session": sid or "unknown", "symbols": got, "ts": now_t,
+                               "market": market, "date": today})
+        _save_claims(market, claims)
         fcntl.flock(lf, fcntl.LOCK_UN)
 
     if conflict:
@@ -471,70 +538,88 @@ def cmd_claim(args):
         print(f"✅ 本会话认领到：{', '.join(got)}")
     else:
         print("⚠️ 候选全部被其它会话占用——换 hot_list 刷新候选再试")
-    print(f"\n📌 当前全局划分（{today}）：\n{_fmt_claims(claims)}")
+    print(f"\n📌 当前全局划分（{market.upper()} {today}）：\n{_fmt_claims(claims)}")
     return 0
 
 
 def cmd_status(_args):
-    today = datetime.now().strftime("%Y-%m-%d")
+    """看当前划分：两个市场各自的当日桶都列（美股看 ET 交易日、港股看本机日期）。"""
+    all_claims = []
+    dates = {}
     with open(LOCK_FILE, "a") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        claims, released = _prune_dead(_load_claims(today))
-        if released:
-            _save_claims(today, claims)
-            fcntl.flock(lf, fcntl.LOCK_UN)
-        else:
-            fcntl.flock(lf, fcntl.LOCK_UN)
+        released = []
+        for m in ("hk", "us"):
+            claims_m, rel = _prune_dead(_load_claims(m))
+            if rel:
+                _save_claims(m, claims_m)   # 顺手当清道夫：把死会话的认领落盘清掉
+                released.extend(rel)
+            all_claims.extend(claims_m)
+            dates[m] = _today_for(m)
+        fcntl.flock(lf, fcntl.LOCK_UN)
     if released:
         for r_sid, r_syms in released:
             print(f"🧹 已释放死会话认领：[{r_sid[:8]}…] 的 {', '.join(r_syms)}")
-    print(f"📌 当前全局划分（{today}）：\n{_fmt_claims(claims)}")
+    stamp = " ｜ ".join(f"{m.upper()} {d}" for m, d in dates.items())
+    print(f"📌 当前全局划分（{stamp}）：\n{_fmt_claims(all_claims)}")
     sid = os.environ.get("PI_SESSION_ID", "")
     if sid:
-        mine = [c for c in claims if c["session"] == sid]
+        mine = [c for c in all_claims if c["session"] == sid]
         if mine:
-            print(f"👉 本会话的池：{', '.join(mine[0]['symbols'])}")
+            print(f"👉 本会话的池：{', '.join(c['symbols'] and ', '.join(c['symbols']) or '（空）' for c in mine)}")
         else:
             print("👉 本会话当前无认领")
     return 0
 
 
 def cmd_release(args):
-    """释放：release --all 释放本会话全部；release SYM[,SYM…] 释放指定标的（仅限本会话持有的）。"""
+    """释放：release --all 释放本会话全部；release SYM[,SYM…] 释放指定标的（仅限本会话持有的）。
+
+    认领表按市场分桶（T198）：按参数里的标的推市场；`--all` 两个市场的桶都清。
+    """
     sid = os.environ.get("PI_SESSION_ID", "")
-    today = datetime.now().strftime("%Y-%m-%d")
     release_all = "--all" in args
     syms = list(dict.fromkeys(_claimable_tokens(a for a in args if a != "--all")))
-    with open(LOCK_FILE, "a") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        claims, _ = _prune_dead(_load_claims(today))
-        removed = []
-        for c in claims:
-            if c["session"] != sid:
-                continue
-            if release_all:
-                removed.extend(c["symbols"])
-                c["symbols"] = []
-                # release --all = 停盯 / 放弃全部：放弃清单一并清空，新会话重新认领
-                c["released"] = []
-            else:
-                for s in syms:
-                    if s in c["symbols"]:
-                        c["symbols"].remove(s)
-                        removed.append(s)
-        # 部分释放的标的记入本会话「放弃清单」（ETF 优先认领闸用——热榜自动并入时排除，
-        # 保证 AI 明确放弃的 ETF 不自动认回）。release --all 已清空（见上），不重复记。
-        if removed and not release_all:
+    if release_all:
+        markets = ["hk", "us"]
+    elif syms:
+        markets = ["hk" if any(s.startswith("HK.") for s in syms) else "us"]
+    else:
+        print("（未指定标的也未加 --all，无可释放）")
+        return 0
+    removed_all = []
+    for market in markets:
+        market_removed = []
+        with open(LOCK_FILE, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            claims, _ = _prune_dead(_load_claims(market))
             for c in claims:
-                if c["session"] == sid:
-                    c.setdefault("released", [])
-                    c["released"] = list(dict.fromkeys(c["released"] + removed))
-        # 空认领条目保留（released 清单要留着；不占池——taken 遍历只认 symbols 非空）
-        claims = [c for c in claims if c["symbols"] or c.get("released")]
-        _save_claims(today, claims)
-        fcntl.flock(lf, fcntl.LOCK_UN)
-    if removed:
-        print(f"✅ 已释放：{', '.join(dict.fromkeys(removed))}（其它会话可认领）")
+                if c["session"] != sid:
+                    continue
+                if release_all:
+                    market_removed.extend(c["symbols"])
+                    c["symbols"] = []
+                    # release --all = 停盯 / 放弃全部：放弃清单一并清空，新会话重新认领
+                    c["released"] = []
+                else:
+                    for s in syms:
+                        if s in c["symbols"]:
+                            c["symbols"].remove(s)
+                            market_removed.append(s)
+            # 部分释放的标的记入本会话「放弃清单」（ETF 优先认领闸用——热榜自动并入时排除，
+            # 保证 AI 明确放弃的 ETF 不自动认回）。release --all 已清空（见上），不重复记。
+            if market_removed and not release_all:
+                for c in claims:
+                    if c["session"] == sid:
+                        c.setdefault("released", [])
+                        c["released"] = list(dict.fromkeys(c["released"] + market_removed))
+            # 空认领条目保留（released 清单要留着；不占池——taken 遍历只认 symbols 非空）
+            claims = [c for c in claims if c["symbols"] or c.get("released")]
+            _save_claims(market, claims)
+            fcntl.flock(lf, fcntl.LOCK_UN)
+        removed_all.extend(market_removed)
+    if removed_all:
+        print(f"✅ 已释放：{', '.join(dict.fromkeys(removed_all))}（其它会话可认领）")
     else:
         print("（本会话没有可释放的认领）")
     return 0
