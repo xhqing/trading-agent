@@ -185,6 +185,8 @@ def main():
     # 美股盘中卖北京零点（= ET 11:00，离收盘还有 5 小时）就提前放行、下一场开盘头
     # 1.5 小时又被误拦——「当日」必须取被交易市场的交易日。
     _ls_ok, _ls_detail = T.check_losing_streak_gate(account=account, market="US")
+    # T199：同一套判据算「若这是实盘会不会被拦」（模拟盘路径用来打标注，实盘路径不重复拦）
+    _ls_would_block, _ls_would_block_detail = T.losing_streak_would_block(market="US")
     if not _ls_ok:
         if force:
             print("⚠️ 一级降频线已触发，--force 用户决策覆盖——放行开仓")
@@ -193,8 +195,7 @@ def main():
             print(json.dumps({"ok": False, "blocked_by": "losing_streak",
                               "action": "open_position_tiger_us", "market": "US", "symbol": symbol,
                               "error": _ls_detail}, ensure_ascii=False))
-            sys.exit(1)
-    # 开仓时间闸（2026-08-18 立）：距美东 16:00 收盘 >5 分钟放行、≤5 分钟或盘外拒单。
+            sys.exit(1)    # 开仓时间闸（2026-08-18 立）：距美东 16:00 收盘 >5 分钟放行、≤5 分钟或盘外拒单。
     # 「距停盯 >5 分钟就仍可开仓」规则的工具级执行点（同港股脚本，函数在
     # trade_utils_tiger.py，本脚本 import 为 T）。
     _gate_ok, _gate_msg = T.check_open_time_gate("US")
@@ -282,6 +283,17 @@ def main():
     }
     if _ls_forced:
         result_base["losing_streak_forced"] = True   # T131：降频线触发但 --force 用户覆盖
+    # T199（2026-11-16 立）：模拟盘不受闸约束，但必须**逐笔标注「若这是实盘会不会被拦」**——
+    # 样本策略与部署策略的差异要可量化：复盘据此把「无闸样本」重放成「按实盘规则」的口径
+    # （EV 双报见 scripts/ev_dual_report.py），样本量不降、口径可切换。
+    # 同时回答记录字段 `would_block_by`，AI 转录 actions 开仓记录时照抄即完成标注。
+    if _ls_would_block and account != "live":
+        result_base["would_block_by"] = "losing_streak"
+        result_base["would_block_detail"] = _ls_would_block_detail
+        result_base["warning"] = ((result_base.get("warning") + "；")
+                                  if result_base.get("warning") else "") + (
+            "⚠️ 本笔若按实盘规则会被一级降频线拦下（would_block_by=losing_streak）——"
+            "模拟盘照常成交（2026-09-14 用户裁定），actions 记录必须带上该字段（T199 双轨标注）")
     if lot_size is not None:
         result_base.update({"auto_sized": True, "equity": equity, "equity_currency": currency,
                             "sizing_source": sizing_source,
@@ -754,6 +766,13 @@ def main():
     # 开仓响铃（2026-08-19 立，同港股版，TODO「auto 开仓成功后响铃提醒」）：成交确认后
     # 响一声；记录写 ring-log-auto.csv 与 signal 隔离（见 trade_utils_tiger.ring_after_fill）
     U.ring_after_fill("US", symbol, note=f"auto成交{result_base['quantity']}股@{fill_price}")
+    # T199（2026-11-16 立）：实盘滑点校准——头 20~30 笔记录
+    # slip_R = |实际成交价 − 决策参考价| ÷ 止损距，把「paper = 决策时刻价、无滑点」
+    # 这个口径差补上（复盘 EV 与实盘期望之间的第二个系统性差异源，第一个是连败闸）。
+    _stop_dist = abs(entry_ref - stop_loss)
+    if _stop_dist > 0 and fill_price is not None:
+        result_base["slip_R"] = round(abs(float(fill_price) - entry_ref) / _stop_dist, 4)
+        result_base["slip_basis"] = "|实际成交价 − 决策参考价| ÷ 止损距（T199 滑点校准口径）"
     # T191HKUS：成交即把初始止损钉进 state/，平仓 R 分母只认这一份（移损不改基准）
     import stop_basis
     stop_basis.record("US", symbol, fill_price, stop_loss,
