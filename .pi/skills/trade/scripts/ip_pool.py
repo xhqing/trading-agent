@@ -969,8 +969,12 @@ def _wait_proxy_port(timeout=PORT_WAIT_TIMEOUT):
 
 MULTI_BASE_PORT = 10871          # 多端口池 http 起始端口（10871..10871+N-1）
 SOCKS_PORT_OFFSET = 10           # socks 端口 = http 端口 + 10（10881..10885），同节点同出口
-MULTI_CONFIG = os.path.join(STATE_DIR, 'ip_pool_xray.json')   # 生成的 xray 配置（含节点凭证 → 必须留在 tmp/）
-MULTI_PID = os.path.join(TMP_DIR, 'ip_pool_xray.pid')
+MULTI_CONFIG = os.path.join(STATE_DIR, 'ip_pool_xray.json')   # 生成的 xray 配置（含节点凭证 → 仅本用户可读）
+# T193（2026-11-13 立）：pid 文件必须放 state/（跨会话共享、worktree 删掉也还在），
+# 不能放 tmp/——每个 worktree 的 tmp/ 是独立一份，放那里等于每个会话都只认得自己起的
+# 实例，于是各起一个 xray；session 结束 / worktree 删除后 pid 文件随之消失，stop_multi()
+# 再没机会调用，进程就永久泄漏（2026-11-13 06:35 实测 10 个孤儿实例）。
+MULTI_PID = os.path.join(STATE_DIR, 'ip_pool_xray.pid')
 MULTI_LOG = os.path.join(TMP_DIR, 'ip_pool_xray.log')
 MULTI_PORTS = os.path.join(STATE_DIR, 'ip_pool_ports.json')
 MULTI_PROBE_TTL = 300            # 端口出口探活缓存有效期（秒）
@@ -1117,25 +1121,109 @@ def _pid_alive(pid):
         return False
 
 
+def _pid_cmdline(pid):
+    """进程命令行（macOS / Linux 通用：ps -o command= -p <pid>）。拿不到返回 ''。"""
+    try:
+        import subprocess as sp
+        out = sp.run(['ps', '-o', 'command=', '-p', str(pid)],
+                     capture_output=True, text=True, timeout=3)
+        return (out.stdout or '').strip()
+    except Exception:
+        return ''
+
+
+def _pid_matches(pid, cfg_path):
+    """该 pid 是否就是「用这份配置跑起来的」那个实例（命令行里带 cfg_path）。"""
+    cmd = _pid_cmdline(pid)
+    return bool(cmd) and cfg_path in cmd
+
+
+def _listener_pids(port):
+    """本机监听该端口的进程 pid 列表（lsof -t；拿不到 / 端口没人听 → 空）。"""
+    try:
+        import subprocess as sp
+        out = sp.run(['/usr/sbin/lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'],
+                     capture_output=True, text=True, timeout=4)
+        return [ln.strip() for ln in (out.stdout or '').splitlines() if ln.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _reap_stale_listeners(ports):
+    """杀掉「监听着本池端口、但不是当前 pid 文件那个进程」的 xray 实例（T193 自愈层）。
+
+    为什么必须有这一层：泄漏出去的孤儿实例占用的正是同一批端口（xray 用 SO_REUSEPORT，
+    多个实例可以同时监听同一端口、不报 bind 冲突），只靠「pid 文件判活」修不掉它们——
+    那些实例对应的 worktree 早已删除、pid 文件也跟着消失，永远没有会被清理的入口。
+    于是每开一个新 worktree 就多一个孤儿、请求在内核层被随机分发到不同实例（同一会话的
+    连续请求落到不同节点集上，「换端口 = 换出口」的语义被打散）。
+
+    安全边界：① 只动命令行里带 `xray` 的进程，绝不误杀别人的服务；② 当前 pid 文件里的
+    实例不动；③ 端口 10871-10876 / 10881-10886 是固定分配给本池的，不存在「别人的合法
+    服务占着它」的正常场景。
+    """
+    me = None
+    try:
+        with open(MULTI_PID) as f:
+            me = f.read().strip()
+    except Exception:
+        pass
+    killed = []
+    for port in ports:
+        for pid in _listener_pids(port):
+            if me and str(pid) == str(me):
+                continue
+            if 'xray' not in _pid_cmdline(pid):
+                continue
+            try:
+                os.kill(int(pid), 15)
+                killed.append((port, int(pid)))
+            except Exception:
+                pass
+    if killed:
+        _log(f'多端口池：清理残留实例 {killed}')
+        time.sleep(0.3)
+    return killed
+
+
 def multi_running():
-    """多端口池 xray 进程是否在跑。"""
+    """多端口池 xray 进程是否在跑，**且跑的是当前这份配置**。
+
+    T193（2026-11-13 立）：原实现只判 `MULTI_PID` 里的 pid 活着。pid 文件当时在 tmp/、
+    每个 worktree 一份，于是 pid 复用（系统把同一 pid 分给别的进程）或残留实例跑的是
+    别的配置时，都会被误判成「在跑」而跳过重启，请求被打到旧节点集上。现在要求命令行
+    里确实带当前 `MULTI_CONFIG` 路径才算在跑。
+    """
     try:
         with open(MULTI_PID) as f:
             pid = f.read().strip()
-        return _pid_alive(pid)
     except Exception:
         return False
+    if not _pid_alive(pid):
+        return False
+    return _pid_matches(pid, MULTI_CONFIG)
 
 
 def stop_multi():
-    """停掉多端口池进程（换配置 / 排查时用）。"""
+    """停掉多端口池进程（换配置 / 排查 / 停盯收尾时用）。"""
+    pid = None
     try:
         with open(MULTI_PID) as f:
             pid = int(f.read().strip())
-        if _pid_alive(pid):
+        if _pid_alive(pid) and _pid_matches(pid, MULTI_CONFIG):
             os.kill(pid, 15)
     except Exception:
         pass
+    if pid is not None:
+        # 等它真的退出（最多 3 秒），避免紧接着 start_multi() 时新旧实例抢同一批端口
+        t0 = time.time()
+        while _pid_alive(pid) and time.time() - t0 < 3:
+            time.sleep(0.1)
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, 9)
+            except Exception:
+                pass
     try:
         os.remove(MULTI_PID)
     except Exception:
@@ -1155,6 +1243,9 @@ def start_multi(force=False):
     if not xray or not os.path.exists(xray):
         _log('多端口池：找不到 xray 可执行文件，回退单实例切换')
         return []
+
+    # T193 自愈层：先把「监听本池端口但不是当前 pid 文件那个实例」的残留 xray 清掉，再判要不要重启
+    _reap_stale_listeners([p for p, _ in mapping])
 
     # 只在「进程没在跑」或「配置内容真的变了」时才重启——判断依据是配置内容是否变化
     # （build_multi_config 的 changed 返回值），不是 mtime（见那里关于 2026-10-29 bug 的注释）。
