@@ -452,9 +452,28 @@ def main():
         result_base["buying_power_max_shares"] = _bp_shares
         result_base["target_quantity"] = quantity
         result_base["quantity"] = capped
+        # T194（2026-11-14 立）：降档后必须重算 max_loss。原实现只改 quantity、`max_loss` 仍是
+        # 降档前（目标量）的值，AI 把这个字段转录进 actions / 复盘 CSV 时 1R 被系统性高估——
+        # 2026-11-13 ET 三笔 NVDA 做空实录：返回 258.04 / 258.37 / 261.76，而按实际成交
+        # 96 / 96 / 94 股重算是 111.20 / 124.15 / 76.11 US$，差 2.3–3.4 倍。
+        # 字段口径与下方「下单被拒降档」分支对齐：计划量留在 planned_max_loss，
+        # max_loss / actual_max_loss 一律按**实际下单股数**算。
+        _planned_ml = result_base.get("max_loss")
+        _actual_ml = U.net_max_loss("US", U._sec_type_of(symbol), capped, entry_ref,
+                                    stop_loss, direction=direction)
+        result_base["planned_max_loss"] = _planned_ml
+        result_base["max_loss"] = round(_actual_ml, 2)
+        result_base["actual_max_loss"] = round(_actual_ml, 2)
+        result_base["actual_max_loss_basis"] = (
+            "net（止损距+开仓费+止损价平仓费，2026-08-28 口径；T194：按降档后股数重算）")
+        _budget_note = ""
+        if result_base.get("budget_B"):
+            _budget_note = (f"，预算 B {result_base['budget_B']:.2f} 的 "
+                            f"{_actual_ml / result_base['budget_B'] * 100:.0f}%")
         result_base["warning"] = (
             f"目标量 {quantity} 股超购买力上限 {_bp_shares} 股（buying_power {_bp_val:,.0f} × "
-            f"保证金率 {_bp_margin} ÷ 参考价 {entry_ref}），下单前主动降档到 {capped} 股——减少被动拒单")
+            f"保证金率 {_bp_margin} ÷ 参考价 {entry_ref}），下单前主动降档到 {capped} 股——减少被动拒单；"
+            f"实际 max_loss {_actual_ml:.2f}{_budget_note}（计划量口径 {_planned_ml}）")
         if capped <= 0:
             result_base.update({"ok": False, "error": "购买力上限降档后为 0（buying_power 不足以开 1 股）"})
             print(json.dumps(result_base, ensure_ascii=False))
@@ -702,7 +721,10 @@ def main():
         actual_max_loss = U.net_max_loss("US", U._sec_type_of(symbol),
                                          result_base["quantity"], entry_ref, stop_loss,
                                          direction=direction)
+        # T194：计划量口径的 max_loss 单独留在 planned_max_loss，max_loss 一律 = 实际成交股数的净 1R
+        result_base["planned_max_loss"] = result_base.get("max_loss")
         result_base["actual_max_loss"] = round(actual_max_loss, 2)
+        result_base["max_loss"] = round(actual_max_loss, 2)
         result_base["actual_max_loss_basis"] = "net（止损距+开仓费+止损价平仓费，2026-08-28 口径）"
         budget_note = ""
         if result_base.get("budget_B"):

@@ -432,6 +432,7 @@ def parse_own_shadows(market, trade_date, stag):
             "exit": num(r"\|\s*平仓价\s*\|\s*([\d.]+)"),
             "net": num(r"净盈亏\*?\*?\s*\|\s*\**\s*([+-]?[\d,]+)"),
             "r": num(r"实际落地赔率\*?\*?\s*\|\s*\**\s*([+-]?[\d.]+)R"),
+            "ml": num(r"净盈亏\s*÷\s*净 max_loss\s*([\d,]+)"),
             "new_stop": num(r"\|\s*新止损\s*\|\s*([\d.]+)"),
         }
         res["events"].append(ev)
@@ -659,6 +660,12 @@ def main():
     sh_closed = [e for e in sh_events if e["kind"] == "平仓"]
     sh_opened = [e for e in sh_events if e["kind"] == "开仓"]
     sh_net = sum((e["net"] or 0) for e in sh_closed)
+    # T195：影子两种 R 口径必须分开写、都标口径名（2026-11-13 ET 实录：飞书把「三笔
+    # 逐笔 R 相加 -2.34R」（累计口径）与「总盈亏 ÷ 总 max_loss -0.80R」（加权口径）
+    # 混在一行、且都没标口径名，被读成「每笔只亏 0.76 个 R」）。
+    sh_ml = sum((e["ml"] or 0) for e in sh_closed)
+    sh_r_cum = sum((e["r"] or 0) for e in sh_closed if e.get("r") is not None)
+    sh_r_w = (sh_net / sh_ml) if sh_ml else None
 
 
     # 币种单位（2026-10-23 用户立：所有金额必须带单位；2026-11-04 修订：美元写 US$、不再用裸 $；
@@ -791,6 +798,11 @@ def main():
         L.append(f"本会话共 **{len(sh_opened)} 笔**影子开仓，其中 **{len(sh_closed)} 笔**已结算"
                  f"（净 {sh_net:+,.0f} 近似值）。影子是「被互斥闸拦下的机会」的纸面记录，"
                  f"与真实仓分开统计。")
+        if sh_closed:
+            L.append("")
+            L.append(f"影子 R 两种口径：**加权口径 {('%.2fR' % sh_r_w) if sh_r_w is not None else 'N/A'}**"
+                     f"（总净额 ÷ 总净 max_loss）；**累计口径 {sh_r_cum:+.2f}R**（逐笔 R 相加）。"
+                     f"两者不可混用——加权口径才是「这一批含金量」的对外口径。")
         if shadows.get("unattributed"):
             L.append("")
             L.append(f"> ⚠️ 本文件里还有 {shadows['unattributed']} 条无 `🆔 会话` 标记的历史影子条目，"
@@ -846,7 +858,8 @@ def main():
         F.append("- 说明：**本场 0 笔真实成交**（本会话当日没有成功开仓的真实订单；"
                  "同一账户当日其它会话的交易不属于本场，不计入）")
     F.append(f"- 净盈亏：**{money(total_pnl)}**")
-    F.append(f"- 整体实际落地赔率：**{('%.2fR' % overall_r) if overall_r is not None else 'N/A'}**（总盈亏 ÷ 总 max_loss {money_abs(total_ml)}）")
+    F.append(f"- 整体实际落地赔率（**加权口径** = 总盈亏 ÷ 总 max_loss {money_abs(total_ml)}）："
+             f"**{('%.2fR' % overall_r) if overall_r is not None else 'N/A'}**")
     F.append(f"- 收工时状态：空仓（无隔夜持仓）")
     # 2026-10-31：代理节点/切换次数属技术运行细节，**不进飞书**（飞书只发业务内容；
     # 节点名还含订阅商域名，属敏感类别，更不能外发）。对话汇报与 actions 总结里照常报。
@@ -865,6 +878,9 @@ def main():
         F.append(f"本场 {len(sh_opened)} 笔开仓机会被「同一账户同一时间只允许一笔在场」闸拦下，"
                  f"按规则改记纸面样本，其中 {len(sh_closed)} 笔已结算（净 {sh_net:+,.0f} 近似值）。"
                  f"影子未下任何真实订单，**不计入本场真实战绩**。")
+        if sh_closed:
+            F.append(f"- 影子 R 两种口径：**加权口径 {('%.2fR' % sh_r_w) if sh_r_w is not None else 'N/A'}**"
+                     f"（总净额 ÷ 总净 max_loss）；**累计口径 {sh_r_cum:+.2f}R**（逐笔 R 相加）")
         F.append("")
         for j, e in enumerate(sh_closed or sh_opened, 1):
             if e["kind"] == "平仓":
@@ -961,6 +977,22 @@ def main():
             print((r.stdout or r.stderr).strip()[-300:])
     else:
         print("ℹ️ 未传 --fx：token 费用未记账（需 CNY/USD 实值，勿估算）")
+
+    # 5) 停盯收尾显式停掉多端口池 xray（T193，2026-11-13 立）
+    # 为什么要在这里停：多端口池是为「盘中快速换出口」起的常驻进程，停盯后没有任何用途；
+    # 不显式停就会跟着会话一起变成孤儿——旧版 pid 文件在 worktree 的 tmp/ 里，会话结束 /
+    # worktree 删除后 pid 文件跟着消失，stop_multi() 再也没机会被调用（2026-11-13 实测
+    # 本机 10 个孤儿实例、每个都在 10871-10886 上监听，请求被随机分发到旧节点）。
+    # 失败不影响收尾（收尾标记与飞书都已落盘，这条只是资源清理）。
+    try:
+        import ip_pool as _IP
+        if _IP.multi_running():
+            _IP.stop_multi()
+            print("🧹 多端口池 xray 已停（停盯收尾「T193）")
+        else:
+            print("ℹ️ 多端口池 xray 未运行（无需清理）")
+    except Exception as _e:
+        print(f"⚠️ 多端口池清理跳过（{_e}）——`python3 scripts/ip_pool.py --multi-stop` 手动确认")
     return 0
 
 
