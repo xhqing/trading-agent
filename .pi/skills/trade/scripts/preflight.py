@@ -260,6 +260,38 @@ except Exception:
 # 交易日（今日 ET 之前，或今日 ET 且已过 16:00 收盘）的 -ET- 记录文件含动作记录（⏰）但无
 # 「停盯总结」字样 → 提醒 / 过线 🚨 催补；多会话日只要任一会话写过总结即不报（单会话粒度
 # 无凭据、不可检测）；零记录日不产生文件、天然不报。港股 12:00 / 16:00 边界当场闭环、不查。
+def _has_real_action(txt):
+    """文件里是否有**真实**动作记录（带 ⏰ 的行、但不属于影子仓条目）。
+
+    T190（2026-11-11 立）：原判据只看「文件里有没有 ⏰」，而影子仓的开仓 / 平仓 / 移损
+    条目天然带 `> ⏰ 影子开仓时间：…` / `影子平仓时间` / `影子移损时间`，且写在
+    `signals/*-ET-signals.md`（该文件本来就不写停盯总结）——于是只要当天落过影子仓，
+    之后连续 7 个自然日里 preflight 每天都报「🚨 美股收尾已过截止线」。2026-11-11 实测
+    11-06 / 11-09 / 11-10 三天全部误报，真报警被假警报淹没。
+
+    判据改成「真实动作 = 含 ⏰ 且不含「影子」的行」：真实条目写的是 `> ⏰ 动作时间：…`，
+    影子条目一律带「影子」二字（开仓 / 平仓 / 移损三种）。
+    """
+    for _line in txt.splitlines():
+        if "⏰" in _line and "影子" not in _line:
+            return True
+    return False
+
+
+def _stop_done_recorded(root, et_date):
+    """该 ET 交易日是否已留下停盯收尾标记（`state/stop_done_us_<date>_<stag>.txt`）。
+
+    T190 第二条判据：收尾标记由 `stop_summary.py` / `mark_stop_done.py` 写、跨会话可见，
+    是比「文件里有没有某段文字」更直接的「已收尾」证据。标记在 = 不必再催（对应
+    `monitor_guard._stop_done_reminder()` 的同一份证据源，两处判定口径一致）。
+    """
+    try:
+        import glob as _g
+        return bool(_g.glob(_os.path.join(root, "state", f"stop_done_us_{et_date.isoformat()}*")))
+    except Exception:
+        return False
+
+
 def _us_wrapup_check():
     try:
         from zoneinfo import ZoneInfo
@@ -279,6 +311,9 @@ def _us_wrapup_check():
     if _us_now.weekday() < 5 and _us_now.hour >= 16:
         _days.append((_us_now.date(), False))
     for _d, _passed in _days:
+        # 收尾标记在 = 该交易日已收尾（无论 signals / actions 里写了什么），不再逐文件报警。
+        if _stop_done_recorded(_root, _d):
+            continue
         for _dir, _name in (("signals", f"{_d.isoformat()}-ET-signals.md"),
                             ("actions", f"{_d.isoformat()}-ET-actions.md")):
             _fp = _os.path.join(_root, _dir, _name)
@@ -286,7 +321,7 @@ def _us_wrapup_check():
                 _txt = open(_fp, encoding="utf-8").read()
             except Exception:
                 continue
-            if "⏰" in _txt and "停盯总结" not in _txt:
+            if _has_real_action(_txt) and "停盯总结" not in _txt:
                 if _passed:
                     print(f"🚨 美股收尾已过截止线：{_d.isoformat()} ET 的 {_dir}/{_name} 有动作记录但无"
                           f"停盯总结——按硬规（美东 24:00 收尾截止）立即补写总结，不等")
