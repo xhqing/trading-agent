@@ -200,7 +200,27 @@ def status(market=None):
 # ---------------------------------------------------------------------------
 
 def _signal_file(market):
-    today = datetime.now().strftime("%Y-%m-%d")
+    """影子条目写到哪个 signals 文件：**按市场交易日**取日期（T195，2026-11-14 立）。
+
+    原实现一律用本机（北京）日期 `datetime.now()`，而美股一个 ET 交易日横跨北京零点
+    （ET 11:00 = 北京次日 00:00）——ET 交易日 11:00 之后落的影子会被写进**次日**的信号文件，
+    当天停盯总结按 ET 日期只读当天那份 → 影子笔数与净额少算，并与沿用旧 R 合计时
+    自相矛盾（2026-11-13 ET 实录：飞书出现「3 笔，净 -287（-1.60R）」，而 3 笔实际
+    是 -1.42R，-1.60R 是含了被写进次日的第 4 笔）。
+
+    口径与 `trade_utils_tiger.market_today('us')` / `log_action.sh et` 同源（都用
+    America/New_York 时区、zoneinfo 自动处理夏令时）；港股 HKT 与北京同区、无此问题，
+    仍用本机日期。这里不 import trade_utils_tiger：本脚本是全项目最轻的入口（无券商 SDK
+    依赖），没必要为了一个日期字符串把整个行情/下单库拉进来。
+    """
+    if str(market).upper() in ("ET", "US"):
+        try:
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            today = datetime.now().strftime("%Y-%m-%d")   # 时区库不可用时兜底（极其罕见）
+    else:
+        today = datetime.now().strftime("%Y-%m-%d")
     return os.path.join(SIGNALS_DIR, f"{today}-{market}-signals.md")
 
 
