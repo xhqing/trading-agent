@@ -279,6 +279,22 @@ def finish():
     # 长会话中 AI 自推时间累计漂移可达 25 分钟（09-18 实录），直接污染压缩止盈窗口
     # 的净赔率实算与停盯收尾时机判断。
     print(f'🕐 段结束墙钟 {time.strftime("%H:%M:%S")}（判断行时间标签照抄本行，禁止推算）', flush=True)
+    # 📌 持仓状态 + 🚨 仓位硬告警（2026-11-17 立，T200）：本采样器此前**完全没有**这一检查，
+    # 港股自动采样段的「账户实持 vs actions 记录」对账缺口由此补齐。硬告警（账户已归零 /
+    # 数量不符 / 漏网持仓 / 查询失败）置顶打红字，其余状态行随后打印；空仓时零 API 调用。
+    try:
+        from account_status import position_status, split_hard_alerts
+        _ps = position_status()
+        if _ps:
+            _hard, _body = split_hard_alerts(_ps)
+            for _ln in _hard:
+                print(_ln, flush=True)
+            if _hard:
+                print('    ↑↑↑ 以上为**仓位状态硬告警**：当段必须处置（核对账户 / 补记平仓），'
+                      '不要扫过去 ↑↑↑', flush=True)
+            print("\n".join(_body), flush=True)
+    except Exception as _e:
+        print(f'[持仓状态检查 err:{_e}]', flush=True)
     print('\n📊 WebSocket 每秒采样段结束统计（最近 N 个点 + 段高低 + 破位）:')
     for sym, d in seg.items():
         pts = d['points']

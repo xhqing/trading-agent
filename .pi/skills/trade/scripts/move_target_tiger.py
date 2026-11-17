@@ -140,21 +140,17 @@ def main():
     result_base = {"action": "move_target_tiger", "market": "HK", "symbol": symbol,
                    "direction": direction, "new_target_price": new_target_price, "quantity": quantity}
 
-    # 量校验：止盈量严格=持仓量
-    try:
-        pos = U.get_open_position_tiger(config, symbol)
-        if pos is not None:
-            held = pos["quantity"]
-            if quantity > held:
-                result_base.update({"ok": False, "error": f"止盈量 {quantity} 超过港股持仓量 {held}，拒绝提交"})
-                print(json.dumps(result_base, ensure_ascii=False))
-                sys.exit(1)
-            if quantity < held:
-                result_base["warning"] = f"止盈量 {quantity} < 持仓量 {held}（策略规定严格相等）"
-        else:
-            result_base["warning"] = "未读到港股持仓，按传入数量继续"
-    except Exception as e:
-        result_base["quantity_check_warning"] = f"持仓校验失败（继续）: {e}"
+    # 持仓硬闸（2026-11-17 立，T201）：二次读持仓 + 当日订单流交叉核对（同美股版）。
+    pos, _perr = U.position_gate_tiger(
+        pos_reader=lambda: U.get_open_position_tiger(config, symbol),
+        orders_reader=lambda: U.get_today_orders_tiger(config),
+        symbol_norm=U.to_tiger_symbol(symbol),
+        direction=direction, quantity=quantity)
+    if _perr:
+        result_base.update({"ok": False, "error": _perr})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    result_base["held"] = int(pos["quantity"])
 
     tc = U.new_trade_client(config)
     tick_sizes = U.get_tick_sizes_tiger(tc, symbol)
