@@ -614,6 +614,8 @@ def main():
     total_pnl = 0.0
     total_ml = 0.0
     wins = 0
+    n_unpaired = 0
+    unpaired_ml = 0.0
     for i, t in enumerate(trades, 1):
         # 原始止损优先（与成交价价差 <1% 视为同一笔）
         cand = sorted(
@@ -639,18 +641,30 @@ def main():
         if fix_r is None:
             fix_r = net_odds_at(t["entry"], t["stop"], tgt_px, t["qty"], a.market)
         ml = net_max_loss(t, a.market)
-        r = (t["pnl"] / ml) if (ml and t["pnl"] is not None) else None
-        total_pnl += t["pnl"] or 0
-        if ml:
-            total_ml += ml
-        if (t["pnl"] or 0) > 0:
-            wins += 1
+        # 未配对成交腿（2026-11-17 立，T198）：根订单没有配对平仓成交 = 孤儿腿 / 未平仓。
+        # 它的盈亏恒为 0，但那条 max_loss 不是任何真实交易的风险——旧实现把它当 0 盈亏行
+        # 照算分母（2026-11-16 实录：两条孤儿腿 max_loss 合计 US$501.60，把当天实际落地
+        # 赔率从 0.83R 稀释成 0.32R）。现在单独统计、不进分子分母，明细里标 ✱。
+        paired = t.get("exit") is not None
+        t["unpaired"] = not paired
+        r = (t["pnl"] / ml) if (ml and t["pnl"] is not None and paired) else None
+        if paired:
+            total_pnl += t["pnl"] or 0
+            if ml:
+                total_ml += ml
+            if (t["pnl"] or 0) > 0:
+                wins += 1
+        else:
+            n_unpaired += 1
+            if ml:
+                unpaired_ml += ml
         rows.append({
             "i": i, "t": t, "ml": ml, "r": r, "init_r": init_r, "fix_r": fix_r, "target": tgt_px,
             "in_bj": bj(t["entry_time"]), "out_bj": bj(t["exit_time"]),
             "in_et": et_hm(t["entry_time"]), "out_et": et_hm(t["exit_time"]),
         })
 
+    n_paired = len(trades) - n_unpaired
     overall_r = (total_pnl / total_ml) if total_ml else None
 
     # 本会话自己的影子（纸面）交易（2026-11-09 用户立：每个会话只汇报自己的成果，
@@ -679,7 +693,9 @@ def main():
 
     print(f"净盈亏 {money(total_pnl)}｜总 max_loss {CUR}{total_ml:.2f}｜整体赔率 "
           f"{('%.2fR' % overall_r) if overall_r is not None else 'N/A'}｜胜率 "
-          f"{(wins / len(trades) * 100 if trades else 0):.0f}%")
+          f"{(wins / n_paired * 100 if n_paired else 0):.0f}%"
+          + (f"｜已剔除未配对成交腿 {n_unpaired} 条（max_loss {CUR}{unpaired_ml:.2f}）"
+             if n_unpaired else ""))
 
     def money_abs(x):
         """不带符号的金额（用于 max_loss 这类恒正项）：US$299.62。"""
@@ -713,7 +729,8 @@ def main():
     for rw in rows:
         t = rw["t"]
         L.append("| {i} | {sym} | {d} | {q} | {e:.4f} | {x} | {p} | {s} | {ml} | {st} | {src} |".format(
-            i=rw["i"], sym=t["symbol"], d=("做多" if t["direction"] == "long" else "做空"),
+            i=rw["i"], sym=t["symbol"] + ("✱" if t.get("unpaired") else ""),
+            d=("做多" if t["direction"] == "long" else "做空"),
             q=t["qty"], e=t["entry"],
             x=("%.4f" % t["exit"]) if t["exit"] else "—",
             p=money(t["pnl"]) if t["pnl"] else money(0),
@@ -721,13 +738,19 @@ def main():
             ml=("%.2f" % rw["ml"]) if rw["ml"] else "—",
             st=stage_str(rw),
             src=t.get("stop_src", "-")))
+    if n_unpaired:
+        L.append("")
+        L.append(f"> ✱ = 未配对成交腿（根订单没有配对平仓成交：孤儿单 / 未平仓），共 {n_unpaired} 条、"
+                 f"max_loss 合计 {money_abs(unpaired_ml)}——**不计入任何统计**（它们不是真实交易，"
+                 f"计进去会稀释实际落地赔率：2026-11-16 实录 0.83R 被稀释成 0.32R）。")
     L.append("")
     L.append("## 二、统计汇总")
     L.append("")
     L.append("| 指标 | 值 |")
     L.append("|---|---|")
     L.append(f"| 净盈亏 | **{money(total_pnl)}** |")
-    L.append(f"| 笔数 / 胜率 | {len(trades)} 笔 / **{(wins / len(trades) * 100 if trades else 0):.0f}%** |")
+    L.append(f"| 笔数 / 胜率 | {n_paired} 笔 / **{(wins / n_paired * 100 if n_paired else 0):.0f}%**"
+             + (f"（另有 {n_unpaired} 条未配对成交腿，已剔除）" if n_unpaired else "") + " |")
     L.append(f"| 总 max_loss（净口径） | {money_abs(total_ml)} |")
     L.append(f"| **整体实际落地赔率** | **{('%.2fR' % overall_r) if overall_r is not None else 'N/A'}**（总盈亏 ÷ 总 max_loss） |")
     _sw = ip_switch_stats(a.market, date, stag)
@@ -846,14 +869,20 @@ def main():
     for rw in rows:
         t = rw["t"]
         F.append("| {i} | {sym} | {d} | {e:.4f} | {x} | {p} | {st} |".format(
-            i=rw["i"], sym=t["symbol"], d=("做多" if t["direction"] == "long" else "做空"),
+            i=rw["i"], sym=t["symbol"] + ("✱" if t.get("unpaired") else ""),
+            d=("做多" if t["direction"] == "long" else "做空"),
             e=t["entry"], x=("%.4f" % t["exit"]) if t["exit"] else "—",
             p=money(t["pnl"]) if t["pnl"] else money(0),
             st=stage_str(rw)))
+    if n_unpaired:
+        F.append("")
+        F.append(f"> ✱ = 未配对成交腿（孤儿单 / 未平仓），共 {n_unpaired} 条——不计入任何统计"
+                 f"（它们不是真实交易，计入会稀释实际落地赔率）。")
     F.append("")
     F.append("## 汇总")
     F.append("")
-    F.append(f"- 笔数：{len(trades)} 笔（{wins} 胜 {len(trades) - wins} 负），胜率 {(wins / len(trades) * 100 if trades else 0):.0f}%")
+    F.append(f"- 笔数：{n_paired} 笔（{wins} 胜 {n_paired - wins} 负），胜率 {(wins / n_paired * 100 if n_paired else 0):.0f}%"
+             + (f"；另有 {n_unpaired} 条未配对成交腿已剔除" if n_unpaired else ""))
     if not trades:
         F.append("- 说明：**本场 0 笔真实成交**（本会话当日没有成功开仓的真实订单；"
                  "同一账户当日其它会话的交易不属于本场，不计入）")

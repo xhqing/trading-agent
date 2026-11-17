@@ -132,7 +132,7 @@
 - **标的分类** `python3 classify_hk_security.py 07709`（skill 根目录，下单前护栏必跑，详见 `references/account-tools.md`）。
 - **开仓** `python3 scripts/open_position_tiger.py HK.00700 long 486 484 489.6 0`（美股用 `open_position_tiger_us.py US.MU ...`）— 6 要素：标的/方向/参考价/止损价/止盈目标/数量（数量传 0 = 自动算仓位）；主单 LMT + 附加止损腿一次提交（无裸奔空窗）；JSON 输出结果。
 - **平仓** `python3 scripts/close_position_tiger.py HK.00700`（美股用 `close_position_tiger_us.py`）— 一键平仓（不给方向/量则自动读持仓）；**主路径 = 把持仓止损单触发价 modify 为现价、止损单立即触发市价平仓**（无「撤止损 + 市价单」两步、无 race）；无活动止损单才直接市价单；modify 失败 / 未触发 fallback 撤止损 + 市价单。平仓后不残留未触发止损单。
-- **移动止损** `python3 scripts/move_stop_tiger.py HK.00700 long 484 100`（美股用 `move_stop_tiger_us.py`）— 把现有止损单触发价 modify 到新止损价、保留单个活动止损（港美同路径，2026-08-05 实测；无活动止损才补下新 STP、modify 失败 fallback 先下新再撤旧）。
+- **移动止损** `python3 scripts/move_stop_tiger.py HK.00700 long 484 100`（美股用 `move_stop_tiger_us.py`）— 把现有止损单触发价 modify 到新止损价、保留单个活动止损（港美同路径，2026-08-05 实测；无活动止损才补下新 STP、modify 失败 fallback 先下新再撤旧）。**持仓硬闸（2026-11-17 立，T198）**：提交前必须确认「持仓在场 + 方向一致 + 数量严格相等 + 触发价未穿越最新价（提交前再取一次最新价复核）」，任一不满足直接拒单（`ok:false` + 退出码 1）、不提交任何单——空仓下「补保护」分支补出来的 STP 就是一张会成交的开仓单（2026-11-16 实录：凭空开出 24 股裸多）。被拒时不要绕：先核实持仓，真的空仓就什么都不做。
 - **共用工具库** `python3 -c "from trade_utils_tiger import ..."` — 老虎 API 封装、价格范围计算（`calc_entry_range`）、仓位计算（`calc_position_size`）。
 - **记录交易动作** `cat <<'ACTION' | bash .pi/skills/trade/scripts/log_action.sh` — 写入 `actions/YYYY-MM-DD-<market>-actions.md`，内容经 stdin 传入，自动带时间戳。
 - **资金流 / 行情**：盯盘资金流走富途 `get_capital_flow`、盘口 `get_order_book`、快照 `get_market_snapshot`（见 `references/account-tools.md` 数据源分工总则）。
