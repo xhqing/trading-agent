@@ -1133,9 +1133,26 @@ def _pid_cmdline(pid):
 
 
 def _pid_matches(pid, cfg_path):
-    """该 pid 是否就是「用这份配置跑起来的」那个实例（命令行里带 cfg_path）。"""
+    """该 pid 是否就是「用这份配置跑起来的」那个实例（命令行里带 cfg_path）。
+
+    2026-11-17 修（T200 排查附带）：原来用字面子串比对 `cfg_path in cmdline`。盯盘 worktree
+    的 `state/` 是指向主仓库的软链，而 `MULTI_CONFIG` 按各自 PROJECT_ROOT 拼出来——同一个
+    物理文件会得到两条不同路径，于是「池在跑」被误判成「没在跑」，脚本又去起第二个实例 →
+    端口冲突 → 报「整池不可用」并弹窗（2026-11-17 17:01 实测：主仓库的池在跑、worktree 里的
+    交易脚本报 no_proxy_pool，就是这条）。现在把命令行 `-c <path>` 与 cfg_path 都取 realpath
+    再比，软链 / 不同 worktree 前缀都能认出来。
+    """
+    import re as _re
     cmd = _pid_cmdline(pid)
-    return bool(cmd) and cfg_path in cmd
+    if not cmd:
+        return False
+    m = _re.search(r"-c\s+(\S+)", cmd)
+    if not m:
+        return cfg_path in cmd
+    try:
+        return os.path.realpath(m.group(1)) == os.path.realpath(cfg_path)
+    except Exception:
+        return m.group(1) == cfg_path
 
 
 def _listener_pids(port):

@@ -1998,6 +1998,108 @@ def get_month_order_count_tiger(config, market=None):
         return None
 
 
+def _order_status_text(o):
+    """订单状态文本（SDK 枚举 .value 是 'Filled'，str(枚举) 是 'OrderStatus.FILLED'，两种都认）。"""
+    st = getattr(o, "status", None)
+    return str(getattr(st, "value", st) or "").upper()
+
+
+def position_gate_tiger(pos_reader, orders_reader, symbol_norm, direction, quantity,
+                        first_wait=0.8, second_wait=1.2):
+    """移损 / 移盈前置持仓硬闸：二次读持仓 + 当日订单流交叉核对（2026-11-17 立，T201）。
+
+    为什么需要它（2026-11-16 美股事故的第二层缺口）：「记录仓位状态变化不及时」是那次
+    事故的触发器——空单 ET 11:07:57 被自己的止损腿平掉、账户归零，会话 8 分半后才察觉，
+    期间发起移损。修掉「空仓不拒单」之后仍剩一个窗口：**券商持仓接口在成交后短暂返回旧值**。
+    闸门若恰好读在那一刻，就会误判「还有持仓」而放行，重新走回补挂止损单 / 止盈单的老路
+    ——空仓下补挂 STP 或 LMT 都是凭空开仓。故硬闸升级为三重证据：
+
+      ① **二次读持仓**（间隔 first_wait 秒）：两次结论不一致 → 再等 second_wait 秒读第三次，
+         仍不一致 → 拒单（接口正在翻转，此刻的任何判断都不可靠）；
+      ② 账户判定**空仓 → 拒单**（不看 actions 记录，记录可能滞后）；
+      ③ **当日订单流交叉核对**：账户说持仓在场，但当日该标的净成交为 0、最后一次成交是
+         平仓方向、数量正好等于本次传入手数 → 判定「持仓接口滞后」→ 拒单。
+
+    参数：
+      pos_reader()    → {'quantity': int, 'side': 'long'|'short'} 或 None；查询失败请抛异常
+      orders_reader() → 当日订单列表（SDK Order 对象）
+      symbol_norm     → 与订单 contract.symbol 匹配的裸代码（港股 5 位数字 / 美股裸代码）
+    返回 (pos|None, err|None)：err 非空 = 必须拒单（调用方打印 ok:false 并退出非 0）。
+    """
+    import time as _t
+
+    def _read():
+        p = pos_reader()
+        if p is None:
+            return None
+        q = int(p.get("quantity") or 0)
+        if q <= 0:
+            return None
+        return {"quantity": q, "side": p.get("side")}
+
+    try:
+        p1 = _read()
+    except Exception as e:
+        return None, (f"持仓查询失败，拒绝提交（无持仓校验就下保护单可能凭空开仓）: {e}；"
+                      f"请先用 account_status.py 或券商 App 核实持仓后再重试")
+    _t.sleep(first_wait)
+    try:
+        p2 = _read()
+    except Exception as e:
+        return None, f"第二次持仓查询失败，拒绝提交（无法确认持仓稳定）: {e}"
+    if (p1 is None) != (p2 is None) or (p1 and p2 and (p1["quantity"] != p2["quantity"]
+                                                       or p1["side"] != p2["side"])):
+        _t.sleep(second_wait)
+        try:
+            p3 = _read()
+        except Exception as e:
+            return None, f"第三次持仓查询失败，拒绝提交（持仓状态不稳定）: {e}"
+        if (p2 is None) != (p3 is None) or (p2 and p3 and p2["quantity"] != p3["quantity"]):
+            return None, (f"持仓状态在 2 秒内反复变化（读数：{p1} → {p2} → {p3}）——"
+                          f"接口正在翻转，此时移损 / 移盈极易下出与实持不符的单，拒绝提交；"
+                          f"请隔几秒重查持仓后再试")
+        p2 = p3
+    pos = p2
+    if pos is None:
+        return None, ("未找到该标的持仓——拒绝提交保护单（空仓下补挂止损 STP / 止盈 LMT 都会"
+                      "凭空开仓；2026-11-16 实录：空仓补挂 BUY STP 被立即触发、开出 24 股裸多）")
+    if str(pos.get("side")) != direction:
+        return None, (f"持仓方向 {pos.get('side')} 与传入 direction={direction} 不符"
+                      f"（{pos['quantity']} 股）——按错误方向下保护单会凭空反向开仓，拒绝提交")
+    if int(quantity) != pos["quantity"]:
+        return None, (f"保护单数量 {quantity} ≠ 实际持仓 {pos['quantity']}——策略规定严格相等"
+                      f"（超量券商判失效、少量会留下无保护敞口），拒绝提交")
+
+    # ③ 当日订单流交叉核对（只拦「刚平完但接口还没刷新」这一种形态，避免误伤隔夜 / 手动仓）
+    try:
+        orders = orders_reader() or []
+    except Exception as e:
+        return None, f"当日订单查询失败，无法交叉核对持仓，拒绝提交: {e}"
+    net = 0
+    last = None
+    for o in orders:
+        sym = str(getattr(getattr(o, "contract", None), "symbol", ""))
+        if sym != symbol_norm:
+            continue
+        if _order_status_text(o) not in ("FILLED", "PARTIALLY_FILLED"):
+            continue
+        q = int(getattr(o, "filled", 0) or getattr(o, "quantity", 0) or 0)
+        if q <= 0:
+            continue
+        act = str(getattr(o, "action", "") or "").upper()
+        ts = int(getattr(o, "trade_time", None) or getattr(o, "order_time", 0) or 0)
+        net += q if act == "BUY" else -q
+        if last is None or ts >= last[0]:
+            last = (ts, act, q)
+    close_act = "BUY" if direction == "short" else "SELL"
+    if net == 0 and last and last[1] == close_act and last[2] == pos["quantity"]:
+        return None, (f"持仓接口疑似滞后：当日该标的净成交 0、最后一笔是 {close_act} "
+                      f"{last[2]} 股（正好等于持仓量），账户却仍报持仓 {pos['quantity']} 股"
+                      f"——大概率刚被平仓、接口尚未刷新，此时下保护单就是凭空开仓，拒绝提交；"
+                      f"请隔 2-3 秒复查持仓后再试")
+    return pos, None
+
+
 def net_max_loss(market, sec_type, shares, entry, stop, direction=None):
     """净 max_loss（2026-08-28 用户立：费计入分母，止损离场恰好 −1R）。
 

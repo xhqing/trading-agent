@@ -591,6 +591,35 @@ def _passive_close_backfill(sym, info, account):
         return f'    → [连败自动补记] 跳过（{str(e)[:120]}）'
 
 
+def split_hard_alerts(block):
+    """把 `position_status()` 的文本块拆成（置顶硬告警, 其余正文）——2026-11-17 立（T200）。
+
+    为什么：position_status 的输出原样打印在段输出中部。2026-11-16 美股实录里，那一段其实
+    已经打了「🚨 账户已无持仓但 actions 无平仓记录」，但夹在价格统计之间被扫过去了——会话
+    8 分半后才察觉仓位早被止盈/止损平掉，期间在空仓上下移损单。段输出信息密度高，必须把
+    「要当段处置」的硬告警抽出来**置顶**，正文照旧留在原位。
+
+    判定：以 🚨 / ⚠️ 开头的行 = 硬告警首行，其后续缩进行（4-7 空格或「    → 」）归为同一条；
+    其余（含 `📌 …账户一致 ✅`）进正文。返回 (hard_lines, body_lines)。
+    """
+    hard, body, cur = [], [], None
+    for ln in (block or "").splitlines():
+        if ln.startswith("🚨") or ln.startswith("⚠️"):
+            if cur:
+                hard.extend(cur)
+            cur = [ln]
+        elif cur is not None and ln.startswith("    ") and ln.strip():
+            cur.append(ln)
+        else:
+            if cur:
+                hard.extend(cur)
+                cur = None
+            body.append(ln)
+    if cur:
+        hard.extend(cur)
+    return hard, body
+
+
 def position_status(account=None):
     """持仓状态段输出（工具强制）。无持仓返回 None（不查账户，遵循「空仓不查」）；有持仓返回多行字符串。
 

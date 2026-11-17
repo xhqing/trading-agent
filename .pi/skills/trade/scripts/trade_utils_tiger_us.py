@@ -422,6 +422,8 @@ get_order_filled_qty_us = T.get_order_filled_qty_tiger
 verify_order_after_cancel_us = T.verify_order_after_cancel_tiger
 # 撤单（不分市场，复用）
 cancel_order_us = T.cancel_order_tiger
+# 移损 / 移盈前置持仓硬闸（2026-11-17 立，T201；逻辑在 trade_utils_tiger 单一源）
+position_gate_tiger = T.position_gate_tiger
 
 
 def has_active_stop_order_us(config, symbol):

@@ -120,21 +120,19 @@ def main():
     result_base = {"action": "move_target_tiger_us", "market": "US", "symbol": symbol,
                    "direction": direction, "new_target_price": new_target_price, "quantity": quantity}
 
-    # 量校验：止盈量严格=持仓量
-    try:
-        pos = U.get_open_position_us(config, symbol)
-        if pos is not None:
-            held = pos["quantity"]
-            if quantity > held:
-                result_base.update({"ok": False, "error": f"止盈量 {quantity} 超过美股持仓量 {held}，拒绝提交"})
-                print(json.dumps(result_base, ensure_ascii=False))
-                sys.exit(1)
-            if quantity < held:
-                result_base["warning"] = f"止盈量 {quantity} < 持仓量 {held}（策略规定严格相等）"
-        else:
-            result_base["warning"] = "未读到美股持仓，按传入数量继续"
-    except Exception as e:
-        result_base["quantity_check_warning"] = f"持仓校验失败（继续）: {e}"
+    # 持仓硬闸（2026-11-17 立，T201）：二次读持仓 + 当日订单流交叉核对。
+    # 旧实现「未读到持仓只 warning 继续」会让凭空开仓重演——空仓下补挂止盈 LMT 同样是开仓单
+    # （2026-11-16 实录：空仓下补挂 BUY STP 被立即触发、开出 24 股裸多）。
+    pos, _perr = U.position_gate_tiger(
+        pos_reader=lambda: U.get_open_position_us(config, symbol),
+        orders_reader=lambda: U.get_today_orders_us(config),
+        symbol_norm=U.to_tiger_symbol_us(symbol),
+        direction=direction, quantity=quantity)
+    if _perr:
+        result_base.update({"ok": False, "error": _perr})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    result_base["held"] = int(pos["quantity"])
 
     tc = U.new_trade_client(config)
     trig = U.round_to_tick_us(new_target_price)

@@ -369,6 +369,24 @@ def finish():
     # 长会话中 AI 自推时间累计漂移可达 25 分钟（09-18 实录），直接污染压缩止盈窗口
     # 的净赔率实算与停盯收尾时机判断。
     print(f'🕐 段结束墙钟 {time.strftime("%H:%M:%S")}（判断行时间标签照抄本行，禁止推算）', flush=True)
+    # 🚨 仓位状态硬告警置顶（2026-11-17 立，T200）：账户实持 vs actions 记录强制对账，
+    # 硬不一致（账户已归零 / 数量不符 / 漏网持仓 / 查询失败）在段输出**最前面**打红字——
+    # 2026-11-16 实录：整块持仓状态原样打在中部，AI 把「账户已无持仓」扫过去了，8 分半后
+    # 才发现仓位早平、期间在空仓上下移损单。正文仍在下方位原处打印，不重复。
+    _pos_body, _pos_hard = None, []
+    try:
+        from account_status import position_status, split_hard_alerts
+        _ps = position_status()
+        if _ps:
+            _pos_hard, _pos_body_lines = split_hard_alerts(_ps)
+            _pos_body = "\n".join(_pos_body_lines)
+    except Exception as _e:
+        print(f'[持仓状态检查 err:{_e}]', flush=True)
+    for _ln in _pos_hard:
+        print(_ln, flush=True)
+    if _pos_hard:
+        print('    ↑↑↑ 以上为**仓位状态硬告警**：当段必须处置（核对账户 / 补记平仓），不要扫过去 ↑↑↑',
+              flush=True)
     print('\n📊 富途逐笔每秒采样段结束统计（按秒点列 + 段高低 + 破位）:')
     for sym, d in seg.items():
         secs = sorted(d['sec'].items())
@@ -393,13 +411,8 @@ def finish():
     # 📌 持仓状态工具强制（2026-08-18 立）：持仓期间段输出自动带出账户持仓 + 活动止损单
     # 最新触发价 + 状态比对告警——AI 开仓后「查账户」从记忆责任变成段输出自带（不凭记忆、
     # 用户 App 手动移损也能当场看到）；空仓时返回 None 静默（遵循「空仓不查」规则，零 API）。
-    try:
-        from account_status import position_status
-        _ps = position_status()
-        if _ps:
-            print(_ps, flush=True)
-    except Exception as _e:
-        print(f'[持仓状态检查 err:{_e}]', flush=True)
+    if _pos_body:
+        print(_pos_body, flush=True)
 
     # ⏰ 每 10 分钟方向重估提醒（2026-08-17 补，逻辑对齐 monitor_segment / ws_segment）。
     try:

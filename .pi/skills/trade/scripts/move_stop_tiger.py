@@ -158,34 +158,17 @@ def main():
     # 铁律：本脚本只改「已有持仓的止损」，必须先确认持仓真实在场且方向 / 数量一致，否则
     # 一律拒单——宁可不动，也绝不凭空开仓。同类复核早已在 close_position_tiger.py 实现
     # （2026-08-16「防凭空反向开仓」），移损脚本此前漏改。
-    try:
-        pos = U.get_open_position_tiger(config, symbol)
-    except Exception as e:
-        result_base.update({"ok": False, "error": (
-            f"持仓查询失败，拒绝提交止损单（无持仓校验就补挂 {stop_side} STP 可能凭空开仓）: {e}；"
-            f"请先用 account_status.py 或券商 App 核实持仓后再重试")})
-        print(json.dumps(result_base, ensure_ascii=False))
-        sys.exit(1)
-    if pos is None or int(pos.get("quantity") or 0) <= 0:
-        result_base.update({"ok": False, "error": (
-            f"未找到 {symbol} 港股持仓——拒绝提交止损单（空仓下提交 {stop_side} STP 会凭空"
-            f"{'开多' if stop_side == 'Buy' else '开空'}仓；要开仓请用 open_position_tiger.py，"
-            f"被动成交请按 actions 流程补记平仓）")})
+    # 持仓硬闸（2026-11-17 立，T198/T201）：二次读持仓 + 当日订单流交叉核对（同美股版）。
+    pos, _perr = U.position_gate_tiger(
+        pos_reader=lambda: U.get_open_position_tiger(config, symbol),
+        orders_reader=lambda: U.get_today_orders_tiger(config),
+        symbol_norm=U.to_tiger_symbol(symbol),
+        direction=direction, quantity=quantity)
+    if _perr:
+        result_base.update({"ok": False, "error": _perr})
         print(json.dumps(result_base, ensure_ascii=False))
         sys.exit(1)
     held = int(pos["quantity"])
-    if str(pos.get("side")) != direction:
-        result_base.update({"ok": False, "error": (
-            f"持仓方向 {pos.get('side')} 与传入 direction={direction} 不符（{symbol} {held} 股）——"
-            f"按错误方向移损会凭空反向开仓，拒绝提交")})
-        print(json.dumps(result_base, ensure_ascii=False))
-        sys.exit(1)
-    if quantity != held:
-        result_base.update({"ok": False, "error": (
-            f"止损量 {quantity} ≠ 港股持仓量 {held}——策略规定严格相等"
-            f"（超量券商判失效、少量会留下无保护敞口），拒绝提交")})
-        print(json.dumps(result_base, ensure_ascii=False))
-        sys.exit(1)
     result_base["held"] = held
 
     tc = U.new_trade_client(config)
