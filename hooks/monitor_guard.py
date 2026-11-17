@@ -114,16 +114,26 @@ STALE_SECONDS = 300     # 超过 5 分钟无更新 = 确定断
 #     停盯收尾 / 平仓以外的任何命令一律阻断（逼 AI 先起下一段再做别的事）。
 SEGMENT_RESTART_GRACE = 20
 SAMPLING_GAP_BLOCK_SECONDS = 60
+#   SAMPLING_GAP_BLOCK_MAX_SECONDS —— pretool 硬拦的**上限**（秒，2026-11-17 立）。断链超过这个
+#     时长就不再硬拦：这就不是「段刚跑完没接上」，而是本会话今天根本没在盯盘——最常见的情形是
+#     上一场盯盘几天前就结束了、`tmp/monitor_log_*` 里留着旧日志。没这道上限时的后果（2026-11-17
+#     实录）：doc / commit 会话因命令里出现 "snapshot" 被拦，根因是最后一份采样日志停在 11-02、
+#     守卫把「15 天前的一行日志」当成「45 秒前断的链」；同一天 `dev-snapshots.py snapshot`（快照
+#     守卫要求的恢复动作）也因此跑不了，两个守卫互相锁死。
+SAMPLING_GAP_BLOCK_MAX_SECONDS = 6 * 3600
 
 # 白名单：采样链断链时仍允许执行的操作。三类——
 #   ① 启动采样段（monitor_segment / ws_segment / futu_ws_segment）
 #   ② 停盯收尾（stop_summary / keepawake_off / monitor_unregister / notify_feishu / mark_stop_done）
 #   ③ 风控平仓（close_position_*，任何时候都要能用，不能被采样链挡住）
+#   ④ 全局共享目录维护（dev-snapshots.py——快照守卫要求的「改前快照」本身就是恢复动作，
+#      而它的子命令恰好带 "snapshot" 字样、会被 pretool 的廉价预筛命中，2026-11-17 实测锁死）
 SAMPLING_OR_WRAPUP_PAT = (
     r"monitor_segment\.py|ws_segment\.py|futu_ws_segment\.py"
     r"|stop_summary\.py|keepawake_off\.sh|monitor_unregister\.sh"
     r"|notify_feishu\.py|mark_stop_done\.py"
     r"|close_position_tiger\.py|close_position_tiger_us\.py"
+    r"|dev-snapshots\.py"
 )
 
 # 空转防护（2026-08-17 立红灯「盯盘空转」修法④）：AI 要重启密采样段时，若分析心跳
@@ -1146,7 +1156,10 @@ def main():
         # 都必须排在「下一段已经跑起来」之后——光靠提醒（stop 分支）挡不住，必须硬拦。
         if not sampling_process_alive()[0]:
             _gap_age = sampling_log_age()
-            if _gap_age is not None and _gap_age >= SAMPLING_GAP_BLOCK_SECONDS:
+            # 只拦「链刚断」的窗口（60 秒 ~ 6 小时）。超上限说明本就没有在盯盘，不能拿旧日志
+            # 卡住与盯盘无关的操作（2026-11-17：15 天前的日志把 doc / commit 会话全锁了）。
+            if (_gap_age is not None
+                    and SAMPLING_GAP_BLOCK_SECONDS <= _gap_age <= SAMPLING_GAP_BLOCK_MAX_SECONDS):
                 if not _re.search(SAMPLING_OR_WRAPUP_PAT, command):
                     print(
                         f"⚠️ 密采样守卫阻断（断链硬拦，2026-11-07 立）：密采样段已停 "
