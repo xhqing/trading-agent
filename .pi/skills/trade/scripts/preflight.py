@@ -410,53 +410,137 @@ except Exception as _e3:
 # 停盯**不联动 unload**（watcher 只剩白名单漂移一个低频提醒、常驻无害；盘外自动静默），用户明确说
 # 「关守卫 / unload watcher」时才手动卸载。
 def _ensure_watcher():
-    """确保两个 launchd 守护项都已部署并 load（幂等）。
+    """确保两个 launchd 守护项**真的可用**（2026-11-05 立 T157；2026-11-17 重做 T198）。
 
-    2026-11-05 扩为两个（T157）：
-      - `com.daytrading.monitor-watcher`：旧密采样守护，2026-10-30 白名单功能移除后已无
-        检查项（脚本直接 return），保留进程只为可回溯，这里仍照旧 ensure（不额外报错）。
-      - `com.daytrading.position-watchdog`：**持仓看护（外部叫醒）**——盘中有持仓但密采样
-        断链、疑似被动平仓、收盘仍有持仓三类情况弹窗提醒。这是 T157 的修复主体：2026-09-16
-        夜盘止损被动成交无人感知，就是因为所有持仓核对都挂在「活着的 AI 会话」里。
+    2026-11-17 为什么要重做（真实事故）：旧实现只判「label 在 launchctl list 里」→ 打印
+    「已在跑」，从不校验 plist 里的脚本路径是否存在。2026-11-09 项目改名
+    DayTradingAgent → trading-agent 时只更新了仓库里的 hooks/*.plist 模板，用户级副本没重新
+    部署，于是 position-watchdog（每 60s）与 monitor-watcher（每 10s）从那天起持续失败，累计
+    9,175 / 54,590 条「can't open file」写进 /tmp，而每场盘前 preflight 都显示「已在跑」。
+    直接后果：2026-11-16 美股止损被动成交后 8 分半无人感知，会话在空仓状态下发起移损 →
+    fallback 补挂 STP 凭空开出 24 股裸多。
+
+    现在的判据（任一不满足就自动修复 + 重载；修复后仍异常就红字）：
+      ① plist 内容必须等于「仓库模板 + 主工作树根路径」——残留旧项目路径、或钉在临时
+         worktree 上的路径都会被识别并重写（worktree 一删就是下一次静默失败）；
+      ② plist 里每个 ProgramArguments 路径必须真实存在；
+      ③ label 必须处于 load 状态；
+      ④ position-watchdog 必须在 5 分钟内写过心跳 = 脚本真的被执行过，而不只是「注册着」。
     """
     import subprocess as _sp
-    import shutil as _sh
+    import time as _time
+    import re as _re_w
 
-    def _ensure_one(label, human):
-        _ls = _sp.run(["launchctl", "list"], capture_output=True, text=True)
-        if label in (_ls.stdout or ""):
-            print(f"🛡️ {human} 已在跑（低频、盘外静默）")
+    def _repo_root():
+        return _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                              "..", "..", "..", ".."))
+
+    def _stable_root():
+        """守护进程指向**主工作树**（main 分支的常驻目录），不钉在临时 worktree 上。"""
+        try:
+            out = _sp.run(["git", "-C", _repo_root(), "worktree", "list", "--porcelain"],
+                          capture_output=True, text=True, timeout=10).stdout
+            for ln in out.splitlines():
+                if ln.startswith("worktree "):
+                    return ln.split(" ", 1)[1].strip()
+        except Exception:
+            pass
+        return _repo_root()
+
+    root = _stable_root()
+
+    def _want_text(tpl_path):
+        txt = open(tpl_path, encoding="utf-8").read()
+        return txt.replace("/Users/xhq/Developer/trading-agent", root)
+
+    def _plist_paths(txt):
+        return [s for s in _re_w.findall(r"<string>([^<]+)</string>", txt) if s.startswith("/")]
+
+    def _uid():
+        return _sp.run(["id", "-u"], capture_output=True, text=True).stdout.strip()
+
+    def _relaunch(label, plist):
+        """重载 plist：新系统走 bootout/bootstrap（gui/<uid>），旧系统回退 unload/load。"""
+        _sp.run(["launchctl", "bootout", f"gui/{_uid()}/{label}"], capture_output=True, text=True)
+        _sp.run(["launchctl", "unload", plist], capture_output=True, text=True)
+        r = None
+        for cmd in (["launchctl", "bootstrap", f"gui/{_uid()}", plist],
+                    ["launchctl", "load", plist]):
+            r = _sp.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                return True, ""
+        return False, ((r.stderr or r.stdout).strip() if r else "未知错误")
+
+    def _ensure_one(label, human, heartbeat_secs=None):
+        short = label.split(".")[-1]
+        tpl = _os.path.join(_repo_root(), "hooks", f"{label}.plist")
+        dst = _os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+        if not _os.path.isfile(tpl):
+            print(f"⚠️ {human}: 仓库模板缺失（{tpl}）——无法自愈，请检查仓库")
             return
-        _plist = _os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
-        _root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "..", "..", ".."))
-        if not _os.path.isfile(_plist):
-            _src = _os.path.join(_root, "hooks", f"{label}.plist")
-            if _os.path.isfile(_src):
-                # 2026-11-05：复制时把项目根路径替换成**当前实际仓库根**——worktree 场景下
-                # （盯盘在 worktree 里跑）不能把 plist 钉死在主仓库绝对路径，否则指向的文件
-                # 可能是旧版本甚至不存在。
-                try:
-                    _txt = open(_src, encoding="utf-8").read()
-                    _txt = _txt.replace("/Users/xhq/Developer/trading-agent", _root)
-                    with open(_plist, "w", encoding="utf-8") as _f:
-                        _f.write(_txt)
-                    print(f"🛡️ 已部署 {human} plist（{_src} → {_plist}，根={_root}）")
-                except OSError as _e:
-                    _sh.copyfile(_src, _plist)
-                    print(f"🛡️ 已部署 {human} plist（复制失败后直接拷贝：{_e}）")
-            else:
-                print(f"⚠️ {human} plist 不存在（{_src}）——该项未开启")
-                return
-        _r = _sp.run(["launchctl", "load", _plist], capture_output=True, text=True)
-        if _r.returncode == 0:
-            print(f"🛡️ {human} 已开启（盘外自动静默）")
+        want = _want_text(tpl)
+        problems = []
+        have = None
+        if _os.path.isfile(dst):
+            try:
+                have = open(dst, encoding="utf-8").read()
+            except OSError:
+                have = None
         else:
-            print(f"⚠️ {human} load 失败（{_r.stderr.strip() or _r.stdout.strip()}）——手动跑 "
-                  f"launchctl load {_plist}")
+            problems.append("plist 未部署")
+        if have is not None:
+            dead = [p for p in _plist_paths(have) if not _os.path.exists(p)]
+            if have.strip() != want.strip():
+                problems.append("plist 与仓库模板不一致"
+                                + (f"（其中不存在：{dead}）" if dead else ""))
+            elif dead:
+                problems.append(f"plist 里有不存在的路径 {dead}")
+        if problems:
+            try:
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.write(want)
+                ok, err = _relaunch(label, dst)
+                print(f"🛡️ {human}: 已重写 plist 并重载（{'；'.join(problems)}）"
+                      + ("" if ok else f" ⚠️ 重载失败：{err}"))
+            except OSError as e:
+                print(f"⚠️ {human}: plist 修复失败（{e}）——手动：launchctl load {dst}")
+                return
+            _time.sleep(2)
+        if label not in (_sp.run(["launchctl", "list"], capture_output=True,
+                                 text=True).stdout or ""):
+            ok, err = _relaunch(label, dst)
+            print(f"🛡️ {human}: {'已开启' if ok else '开启失败（' + err + '）'}")
+        elif not problems:
+            print(f"🛡️ {human}: 已部署、已加载、plist 路径有效")
+        if heartbeat_secs:
+            beat = _os.path.realpath(_os.path.join(root, "state", "watchdog_beat.json"))
+
+            def _age():
+                try:
+                    return _time.time() - _os.path.getmtime(beat)
+                except OSError:
+                    return None
+
+            age = _age()
+            if age is None or age > heartbeat_secs:
+                # 主动踢一次让它立刻跑，再判（launchd 轮询有延迟，不踢容易误报）
+                _sp.run(["launchctl", "kickstart", "-k", f"gui/{_uid()}/{label}"],
+                        capture_output=True, text=True)
+                _time.sleep(2.5)
+                age = _age()
+            if age is None:
+                print(f"🚨 {human}: 心跳文件不存在——脚本从未被真正执行过！"
+                      f"看 /tmp/daytrading-{short}.err")
+            elif age > heartbeat_secs:
+                print(f"🚨 {human}: 心跳已 {int(age)} 秒未更新（阈值 {heartbeat_secs}s）——"
+                      f"进程可能在静默失败，看 /tmp/daytrading-{short}.err")
+            else:
+                print(f"🛡️ {human}: 心跳正常（{int(age)} 秒前）")
 
     _ensure_one("com.daytrading.monitor-watcher", "密采样守护 watcher（历史项、已无检查项）")
     _ensure_one("com.daytrading.position-watchdog",
-                "持仓看护 watchdog（持仓无人盯 / 疑似被动平仓 / 收盘仍有仓）")
+                "持仓看护 watchdog（持仓无人盯 / 疑似被动平仓 / 收盘仍有仓）",
+                heartbeat_secs=300)
 
 _ensure_watcher()
 

@@ -60,6 +60,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", ".."))
@@ -67,6 +68,13 @@ TMP_DIR = os.path.join(PROJECT_ROOT, "tmp")
 STATE_DIR = os.path.join(PROJECT_ROOT, "state")
 LOG_PATH = os.path.join(TMP_DIR, "position_watchdog.log")
 STATE_PATH = os.path.join(STATE_DIR, "position_watchdog.json")
+# 心跳（2026-11-17 立，T198 事故修复）：每次被 launchd / 手工拉起就写一次，供 preflight
+# 判断「这条防线到底还在不在跑」——进程根本没起来时不会有心跳（旧版 plist 路径失效后静默
+# 死了 6 天多，而每场盘前 preflight 都显示「已在跑」）。
+BEAT_PATH = os.path.join(STATE_DIR, "watchdog_beat.json")
+# 待 AI 处置的告警队列（2026-11-17 立）：弹窗只到人、不进 AI 上下文，故另存一份给
+# hooks/monitor_guard.py 在回合静止时注入对话（配 --ack 清除）。
+ALERTS_PATH = os.path.join(STATE_DIR, "position_alerts.json")
 PANEL_BIN = os.path.join(TMP_DIR, "alert_panel")
 
 DEFAULT_STALE_SECONDS = 300       # 采样停更阈值（40 秒一段 × 7 倍余量）
@@ -223,6 +231,89 @@ def _log(line):
             f.write(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\t" + line + "\n")
     except OSError:
         pass
+
+
+def _atomic_json(path, data):
+    """原子写 JSON；写前 realpath 解析真实路径（state/ 在 worktree 里是软链回主仓库，
+    直接 os.replace 会把软链本身替成实体文件，2026-11-08 立的口径）。"""
+    real = os.path.realpath(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    tmp = real + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, real)
+
+
+def write_heartbeat(label=""):
+    """写一次心跳（盘内盘外、有仓无仓、dry-run 都写）。
+
+    为什么（2026-11-17 立，T198）：持仓看护是**独立于 AI 会话**的防线，一旦 plist 指向的
+    脚本路径失效（项目改名 / worktree 被删），launchd 会每 60 秒失败一次而没人知道——
+    2026-11-09 改名后它就这么静默死了 6 天多，2026-11-16 的止损被动成交因此无人感知，
+    最终演变成空仓下补挂止损单、凭空开出 24 股裸多。心跳是 preflight 能验证「这条防线
+    还活着」的唯一信号（没被执行过的进程写不出心跳）。
+
+    写失败不能影响看护本体，故全量吞异常。
+    """
+    try:
+        _atomic_json(BEAT_PATH, {
+            "ts": time.time(),
+            "at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pid": os.getpid(),
+            "label": label or "/".join(sys.argv[1:]),
+            "script": os.path.abspath(__file__),
+        })
+    except Exception:
+        pass
+
+
+def load_alert_queue():
+    """读待处置告警队列 → [{key, market, title, message, ts}]（文件缺失/损坏返回 []）。"""
+    try:
+        with open(os.path.realpath(ALERTS_PATH), encoding="utf-8") as f:
+            data = json.load(f)
+        return [a for a in (data.get("alerts") or []) if a.get("key")]
+    except Exception:
+        return []
+
+
+def queue_alerts(alerts):
+    """把本轮告警并入待处置队列（同 key 覆盖、其余保留）。
+
+    为什么（2026-11-17 立，T198）：原来告警只走弹窗 + 响铃——**只到人、不到 AI**。止损被
+    动成交这类事件需要 AI 立即补记平仓 / 修正统计口径，光叫人不算闭环。
+    """
+    if not alerts:
+        return
+    now = time.time()
+    cur = {a["key"]: a for a in load_alert_queue()}
+    for a in alerts:
+        if not a.get("key"):
+            continue
+        cur[a["key"]] = {"key": a["key"], "market": a.get("market"),
+                         "title": a.get("title"),
+                         "message": (a.get("message") or "").splitlines()[0] if a.get("message") else "",
+                         "ts": now}
+    try:
+        _atomic_json(ALERTS_PATH, {"alerts": list(cur.values()), "updated": now})
+    except Exception:
+        pass
+
+
+def ack_alerts(keys):
+    """清除队列告警：keys == "all" 或 key 列表；返回剩余条数。"""
+    cur = load_alert_queue()
+    if str(keys).strip() == "all":
+        rest = []
+    else:
+        drop = {k.strip() for k in str(keys).split(",") if k.strip()}
+        rest = [a for a in cur if a["key"] not in drop]
+    try:
+        _atomic_json(ALERTS_PATH, {"alerts": rest, "updated": time.time()})
+    except Exception:
+        pass
+    return len(rest)
 
 
 def _resume_cooldown_left(state, key, cooldown=None):
@@ -466,7 +557,28 @@ def main(argv=None):
     ap.add_argument("--close-grace-min", type=int, default=DEFAULT_CLOSE_GRACE_MIN)
     ap.add_argument("--reconcile", action="store_true",
                     help="只跑全局对账（记录持仓 vs 账户实持），不看时段、不弹窗")
+    ap.add_argument("--ack", metavar="KEYS", default=None,
+                    help="清除待 AI 处置的告警队列：all 或逗号分隔的 key（处置完用）")
+    ap.add_argument("--queue", action="store_true",
+                    help="只打印当前待处置告警队列（不查账户、不弹窗）")
     args = ap.parse_args(argv)
+
+    # 心跳最先写（2026-11-17 立）：只要进程真被拉起就留下痕迹，供 preflight 判断
+    # 「看护到底还在不在跑」——路径写错 / 解释器坏掉时根本走不到这里。
+    write_heartbeat()
+
+    if args.ack is not None:
+        left = ack_alerts(args.ack)
+        print(f"✅ 已清除告警，剩余 {left} 条" + (f"（{ALERTS_PATH}）" if left else ""))
+        return 0
+
+    if args.queue:
+        q = load_alert_queue()
+        if not q:
+            print("✅ 待处置告警队列为空")
+        for a in q:
+            print(f"🚨 [{a.get('market')}] {a.get('title')}：{a.get('message')}")
+        return 0
 
     if args.reconcile:
         lines, data = global_reconcile()
@@ -479,6 +591,9 @@ def main(argv=None):
         return 2 if bad else 0
 
     alerts, info = evaluate(args.stale_seconds, args.close_grace_min)
+    # 告警入队（2026-11-17 立）：弹窗只到人，队列才是 AI 能看到的通道；冷却只屏蔽弹窗，
+    # 不屏蔽入队——否则同一事件在冷却窗口内 AI 永远学不到。
+    queue_alerts(alerts)
     state = load_state()
     shown = []
     for a in alerts:

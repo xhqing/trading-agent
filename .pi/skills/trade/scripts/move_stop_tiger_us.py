@@ -115,29 +115,73 @@ def main():
             f"要主动平仓请用 close_position_tiger_us.py，不要用移损脚本")}, ensure_ascii=False))
         sys.exit(1)
 
+    def _fresh_trigger_guard(where):
+        """提交前用最新价复核触发价方向（2026-11-17 立，T198 事故修复）。
+
+        下单前那次 quote 校验与真正 submit 之间可能隔几秒，价格一旦穿越触发价，STP 提交即
+        市价成交（2026-11-16 实录：11:14:55 价 818.16、校验 820 合法；11:15:04 提交时价已到
+        820 一线）。返回 None = 通过；返回字符串 = 拒单原因（调用方 ok:false + exit 1）。
+        """
+        try:
+            _q = U.get_quote_us(config, symbol)
+        except Exception as e:
+            return f"{where}前取最新价失败，拒绝提交（无法确认触发价未穿越现价）: {e}"
+        if not _q or _q.get("last") is None:
+            return f"{where}前最新价为空，拒绝提交（无法确认触发价未穿越现价）"
+        _l = float(_q["last"])
+        if direction == "long" and new_stop_price >= _l:
+            return (f"{where}前最新价 {_l}，做多止损 {new_stop_price} 已到/穿越现价——"
+                    f"提交会瞬间市价触发清仓，拒绝；请按最新价重新判断后再移损")
+        if direction == "short" and new_stop_price <= _l:
+            return (f"{where}前最新价 {_l}，做空止损 {new_stop_price} 已到/穿越现价——"
+                    f"提交会瞬间市价触发清仓，拒绝；请按最新价重新判断后再移损")
+        return None
+
     result_base = {"action": "move_stop_tiger_us", "market": "US", "symbol": symbol, "direction": direction,
                    "new_stop_price": new_stop_price, "quantity": quantity}
+    stop_side = "Sell" if direction == "long" else "Buy"
 
-    # 量校验：止损量严格=持仓量（超持仓券商判失效）
+    # ── 持仓硬闸（2026-11-17 立，T198 事故修复；本文件与港股 move_stop_tiger.py 同款）──
+    # 事故：2026-11-16 ET 11:07:57 空头仓位的止损腿按计划成交、账户已归零；11:14:55 会话仍
+    # 以为持仓在场，发起「826 → 820 移损」。旧实现「未读到持仓」只写 warning 继续，于是走
+    # fallback「补保护」分支提交 BUY STP @820 —— 空仓状态下 1 秒内成交、凭空开出 24 股裸多
+    # （+US$95.40 纯属运气）。根因不是查询失效（查询结果是对的），而是**空仓不拒单**。
+    # 铁律：本脚本只改「已有持仓的止损」，必须先确认持仓真实在场且方向 / 数量一致，否则
+    # 一律拒单——宁可不动，也绝不凭空开仓。同类复核早已在 close_position_tiger_us.py 实现
+    # （2026-08-16「防凭空反向开仓」），移损脚本此前漏改。
     try:
         pos = U.get_open_position_us(config, symbol)
-        if pos is not None:
-            held = pos["quantity"]
-            if quantity > held:
-                result_base.update({"ok": False, "error": f"止损量 {quantity} 超过美股持仓量 {held}，券商判失效，拒绝提交"})
-                print(json.dumps(result_base, ensure_ascii=False))
-                sys.exit(1)
-            if quantity < held:
-                result_base["warning"] = f"止损量 {quantity} < 持仓量 {held}（策略规定严格相等）"
-        else:
-            result_base["warning"] = "未读到美股持仓，按传入数量继续"
     except Exception as e:
-        result_base["quantity_check_warning"] = f"持仓校验失败（继续）: {e}"
+        result_base.update({"ok": False, "error": (
+            f"持仓查询失败，拒绝提交止损单（无持仓校验就补挂 {stop_side} STP 可能凭空开仓）: {e}；"
+            f"请先用 account_status.py 或券商 App 核实持仓后再重试")})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    if pos is None or int(pos.get("quantity") or 0) <= 0:
+        result_base.update({"ok": False, "error": (
+            f"未找到 {symbol} 美股持仓——拒绝提交止损单（空仓下提交 {stop_side} STP 会凭空"
+            f"{'开多' if stop_side == 'Buy' else '开空'}仓；要开仓请用 open_position_tiger_us.py，"
+            f"被动成交请按 actions 流程补记平仓）")})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    held = int(pos["quantity"])
+    if str(pos.get("side")) != direction:
+        result_base.update({"ok": False, "error": (
+            f"持仓方向 {pos.get('side')} 与传入 direction={direction} 不符（{symbol} {held} 股）——"
+            f"按错误方向移损会凭空反向开仓，拒绝提交")})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    if quantity != held:
+        result_base.update({"ok": False, "error": (
+            f"止损量 {quantity} ≠ 美股持仓量 {held}——策略规定严格相等"
+            f"（超量券商判失效、少量会留下无保护敞口），拒绝提交")})
+        print(json.dumps(result_base, ensure_ascii=False))
+        sys.exit(1)
+    result_base["held"] = held
 
     tc = U.new_trade_client(config)
     trig = U.round_to_tick_us(new_stop_price)
     target_sym = U.to_tiger_symbol_us(symbol)
-    stop_side = "Sell" if direction == "long" else "Buy"
 
     # 查当前活动止损单（该标的、止损类型含 TRAIL、非终结状态）
     stp_orders = []
@@ -154,6 +198,11 @@ def main():
     # 路径分支 0：无活动止损单 → 下新 STP（补保护）
     if len(stp_orders) == 0:
         result_base["path"] = "no_active_stop → submit new STP"
+        _bad = _fresh_trigger_guard("补挂新 STP")
+        if _bad:
+            result_base.update({"ok": False, "error": _bad, "path": "no_active_stop → 拒单（触发价已穿越现价）"})
+            print(json.dumps(result_base, ensure_ascii=False))
+            sys.exit(1)
         try:
             stop_order_id = U.submit_stop_order_us(config, symbol, stop_side, quantity, trig)
         except Exception as e:
@@ -189,6 +238,11 @@ def main():
         # 新单提交成功 + 撤旧失败 = ok:true + warning（原实现整体报 ok:false、AI 误信无止损
         # 再补挂 → 多重止损）；新单提交超时（模糊失败）如实报「可能已提交、先查订单再补挂」。
         result_base["modify_failed_fallback"] = f"modify 抛异常 {e}，回退到「先下新 STP + 撤旧」"
+        _bad = _fresh_trigger_guard("fallback 补挂新 STP")
+        if _bad:
+            result_base.update({"ok": False, "error": _bad + "（旧止损单仍在场、未做任何改动）"})
+            print(json.dumps(result_base, ensure_ascii=False))
+            sys.exit(1)
         new_id = None
         new_err = None
         try:

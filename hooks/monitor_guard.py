@@ -320,8 +320,7 @@ def _stop_done_reminder(payload=None):
             f"—— 它会一次生成【券商对账明细 + 北京日期对照表 + 统计 + 飞书业务版推送】并写收尾标记。"
             f"（2026-10-19 事故：只停采样没做收尾，飞书没发、用户次日才发现。）"
         )
-        _emit_reminder(msg, "Stop")
-        return
+        return msg
 
     # 港股同款检查（2026-10-20 补；标记匹配/时间门槛与美股段同口径）：HKT actions 按
     # 【北京日期】命名，标记为 stop_done_hk_<北京日期>_<stag>。
@@ -357,9 +356,66 @@ def _stop_done_reminder(payload=None):
         _emit_reminder(
             f"⚠️ 停盯收尾缺失提醒：{d}（港股交易日）有成交记录，但没有停盯收尾标记"
             f"（{os.path.basename(cands[0])}）。停盯必须跑："
-            f"`python3 .pi/skills/trade/scripts/stop_summary.py --market hk --date {d}`。",
-            "Stop")
-        return
+            f"`python3 .pi/skills/trade/scripts/stop_summary.py --market hk --date {d}`。")
+        return msg
+
+
+def _position_alerts_reminder(payload=None):
+    """把持仓看护攒下的「待 AI 处置」告警注入对话（2026-11-17 立，T198 事故修复）。
+
+    为什么需要它：`position_watchdog.py`（独立于 AI 会话的看护进程，launchd 每 60 秒）
+    原本只走弹窗 + 响铃——**只到人、不到 AI**。2026-11-16 美股实录：ET 11:07:57 空头仓位的
+    止损腿按计划成交、账户归零，会话 8 分半都没察觉，11:14:55 在空仓状态下发起移损 →
+    fallback 补挂 BUY STP → 1 秒内成交、凭空开出 24 股裸多。看护本应在 60 秒内发现
+    「记录有仓、账户已空」，但它的告警 AI 看不到，等于没叫醒。
+
+    机制：看护把告警写进 state/position_alerts.json，本函数在回合静止（Stop 事件）时读出
+    并注入上下文；AI 处置完用
+    `python3 .pi/skills/trade/scripts/position_watchdog.py --ack all` 清队列。
+    节流：同一 key 10 分钟内只推一次（Stop 每回合都触发，不节流会刷屏）。
+
+    返回要注入的文本（无新告警返回 None）——由 main 统一 _emit_reminder，因为 pi 扩展的
+    additionalContext 只取 stdout 最后一条 JSON，多个提醒必须合并成一条。
+    """
+    root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    qpath = os.path.join(root, "state", "position_alerts.json")
+    try:
+        with open(os.path.realpath(qpath), encoding="utf-8") as f:
+            alerts = [a for a in (json.load(f).get("alerts") or []) if a.get("key")]
+    except Exception:
+        return None
+    if not alerts:
+        return None
+
+    now = time.time()
+    ppath = os.path.realpath(os.path.join(root, "tmp", "position_alerts_pushed.json"))
+    pushed = {}
+    try:
+        with open(ppath, encoding="utf-8") as f:
+            pushed = json.load(f) or {}
+    except Exception:
+        pushed = {}
+    fresh = [a for a in alerts if now - float(pushed.get(a["key"], 0) or 0) >= 600]
+    if not fresh:
+        return None
+    for a in fresh:
+        pushed[a["key"]] = now
+    try:
+        os.makedirs(os.path.dirname(ppath), exist_ok=True)
+        with open(ppath, "w", encoding="utf-8") as f:
+            json.dump(pushed, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+    lines = ["🚨 **仓位状态告警**（外部看护 `position_watchdog` 已核实，非采样推测；"
+             "这类事件必须当场处置，不能等采样自己发现）："]
+    for a in fresh:
+        lines.append(f"- [{a.get('market') or '?'}] {a.get('title')}：{a.get('message')}")
+    lines.append("")
+    lines.append("处置要求：① 立即用 `account_status.py` / 券商实持核实；② 若确是被动成交（止损 / 止盈触发、"
+                 "意外反向开仓），按 actions 流程补记平仓并修正当笔 R；③ 若已无持仓且无残留挂单，"
+                 "跑 `python3 .pi/skills/trade/scripts/position_watchdog.py --ack all` 清空队列。")
+    return "\n".join(lines)
 
 
 def sampling_process_alive():
@@ -947,10 +1003,23 @@ def main():
     # 停盯收尾缺失检查提到时段门外（2026-10-20）：收尾这件事恰恰最容易在「盘外」
     # 才发现（例如美股收盘后 / 次日），若跟其它守卫一起被时段门早退挡掉就永远不提醒。
     if hook_type == "stop":
+        # 多条提醒必须合并成**一条**发（2026-11-17 修）：pi 扩展的 additionalContext 只取
+        # stdout 最后一条 JSON，分两次 _emit_reminder 会互相覆盖（后一条把前一条顶掉）。
+        _msgs = []
         try:
-            _stop_done_reminder(payload)
+            _m = _stop_done_reminder(payload)
+            if _m:
+                _msgs.append(_m)
         except Exception:
             pass
+        try:
+            _m = _position_alerts_reminder(payload)
+            if _m:
+                _msgs.append(_m)
+        except Exception:
+            pass
+        if _msgs:
+            _emit_reminder("\n\n".join(_msgs), "Stop")
 
     # 盘外不干预（周末 / 夜间 / 午休）
     if not in_trading_session():
