@@ -2741,11 +2741,23 @@ def load_equity(mode='signal', project_root=None, base_currency='HKD', account=N
         # 净 R 口径的可比性靠这个基准维持、不依赖实时实盘数值——实盘资产为 0 / 资金全部
         # 取出，模拟盘照常交易。旧「auto 模拟盘恒用实盘当日快照」口径（2026-09-03 立）废止，
         # 见本文件「模拟盘算仓位参考（解耦，2026-09-12）」节。
+        # 2026-11-18 用户立：auto 与 signal 完全解耦、文件不复用——auto 用独立账本
+        # state/auto_equity.json（随已平仓交易联动，复利 / 缩水真正生效）；signal 仍用 equity-log。
+        if mode == "auto":
+            try:
+                import auto_equity as _AE
+                _info = _AE.sync()
+                _eq_hkd = float(_info["equity_hkd"])
+                if base_currency == "HKD":
+                    return _eq_hkd, "HKD", _info["source"]
+                return (_eq_hkd / paper_sizing_reference()["fx_hkd_per_usd"], "USD", _info["source"])
+            except Exception as _e:
+                return initial_equity, currency, f"config initial_equity={initial_equity:.0f}（auto 账本读取失败：{_e}）"
         eq = _read_equity_log()
         if eq is None:
             return initial_equity, currency, f"config initial_equity={initial_equity:.0f}（equity-log 无记录，纸面基准兜底）"
-        if mode == "signal" or base_currency == "HKD":
-            return eq, currency, "signals/equity-log.csv 末行（纸面权益；signal 与 auto 模拟盘同源，2026-09-12 解耦）"
+        if base_currency == "HKD":
+            return eq, currency, "signals/equity-log.csv 末行（signal 模式纸面权益，2026-09-12 立）"
         # 美股模拟盘要 USD 口径：按模拟盘自身两币种净值比折算（老虎 forex_rate，不碰实盘）
         ref = paper_sizing_reference()
         return (eq / ref["fx_hkd_per_usd"], "USD",
@@ -3020,19 +3032,18 @@ def paper_sizing_reference(config=None):
         initial_equity = float(_risk_cfg.get("initial_equity", _PAPER_BASE_FALLBACK))
     except Exception:
         pass
+    # 2026-11-18 用户立（auto / signal 完全解耦、文件不复用）：auto 模式用**独立权益账本**
+    # state/auto_equity.json（auto_equity.py：基准 + 已平仓交易实现盈亏自动累加，幂等自愈）。
+    # 不再读 signals/equity-log.csv（那是 signal 模式的账，auto 只读不写等于复利机制停摆）。
     equity_hkd = initial_equity
-    equity_source = f"config initial_equity={initial_equity:.0f}（equity-log 无记录，纸面基准兑底）"
+    equity_source = f"config initial_equity={initial_equity:.0f}（auto 账本不可用，兜底）"
     try:
-        import csv as _csv
-        log_path = Path(project_root) / "signals" / "equity-log.csv"
-        if log_path.exists():
-            with open(log_path) as f:
-                rows = [r for r in _csv.DictReader(f) if not (r.get("date") or "").startswith("#")]
-            if rows:
-                equity_hkd = float(rows[-1]["equity_after"])
-                equity_source = "signals/equity-log.csv 末行（纸面权益，2026-09-12 解耦）"
-    except Exception:
-        pass
+        import auto_equity as _AE
+        _info = _AE.sync()
+        equity_hkd = float(_info["equity_hkd"])
+        equity_source = _info["source"]
+    except Exception as _e:
+        equity_source = f"config initial_equity={initial_equity:.0f}（auto 账本读取失败：{_e}）"
     # 2) 模拟盘自身数据：总融资杠杆 + 汇率（都不碰实盘）
     fx_hkd_per_usd = 7.80
     margin_leverage = float(_risk_cfg.get("paper_margin_leverage_default", 4.0))
