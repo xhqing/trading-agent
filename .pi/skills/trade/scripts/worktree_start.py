@@ -69,6 +69,9 @@ LOCAL_FILES = [
     ".pi/skills/trade/config.json",
     ".pi/skills/trade/feishu.local.json",
     "reviews/ip-node-log.local.csv",
+    # signal 模式的纸面权益账本（auto 模式已改用 state/auto_equity.json，两者完全解耦；
+    # 这条只服务 signal 会话，缺失会让 signal 的 B 退回 initial_equity）
+    "signals/equity-log.csv",
 ]
 
 

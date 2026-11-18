@@ -4,6 +4,19 @@
 
 > 复盘口径补强：R 是技能口径、不能直接乘 B 当金额；新增「金额口径四情景 + 三项诊断」，并在复盘报告里强制包含。
 
+### 变更（auto 模式启用独立权益账本，复利 / 缩水真正联动；与 signal 完全解耦、文件不复用，2026-11-18 用户立）
+
+- **为什么改**：auto 模拟盘算仓位的 equity 一直是**只读** `signals/equity-log.csv`（那是 signal 模式的账），每笔平仓的盈亏不会回流 → `B = 2% × equity` 永远不变，所谓「权益涨 → B 放大、权益跌 → B 缩」在 auto 下从未生效。2026-11-18 用户明确要求：这套联动要在 auto 模式跑起来，且两模式**完全独立、文件不复用**。
+- **改了什么**：
+  1. 新增 `scripts/auto_equity.py`：auto 专属权益账本 `state/auto_equity.json`（`state/` 在 worktree 里是软链，所以各 worktree 盯盘共用同一份）。机制：`equity = 基准 + Σ 已平仓交易的实现盈亏（折 HKD）`，数据源是券商模拟账户成交单（复用 `stop_summary.build_trades` 的父子单配对，取平仓腿 `realized_pnl`），**幂等**（按平仓腿 order id 去重）、**自愈**（被动止损 / 会话中断漏记都会在下次 sync 自动补齐）、**每次按「基准 + Σ已入账」重算**（不靠增量、不会漂移）；只认「账本建立之后才平仓」的交易。CLI：`show` / `sync` / `reset --baseline`。
+  2. `trade_utils_tiger.paper_sizing_reference()` 与 `load_equity(mode='auto')` 改读该账本；signal 分支原样走 `signals/equity-log.csv`。因此开仓脚本、preflight、resume、monitor 的 auto equity 口径全部切换，**auto 不再读 signal 的账本**。
+  3. `stop_summary.build_trades()` 增加 `exit_order_id` 字段（账本幂等键）。
+  4. `worktree_start.py` 的 `LOCAL_FILES` 补 `signals/equity-log.csv`（只服务 signal 会话；auto 已不依赖它）。
+  5. `config.risk.auto_initial_equity` 新增（账本基准，缺省回退 `initial_equity`；本次取与模拟实盘起步规模一致的量级，具体数值见本机 `config.json`，不入库）。
+  6. 文档同步：`references/auto-mode.md`「auto 模式算仓位口径」、`SKILL.md`（三处 equity 来源表述）、`references/risk-management.md` 均改为「auto 独立账本 + 与 signal 完全解耦」。
+- **验证**：单元级三项断言全过（累加正确：基准 100000 + 港股 +500 + 美股 +100 USD×7.84 → 101284.00；二次 sync 幂等新增 0；早于账本建立的平仓被过滤）；实测 `load_equity('auto')` 走 `state/auto_equity.json`、`load_equity('signal')` 仍走 `signals/equity-log.csv`（两条链互不影响，各自金额见本机账本，不入库）；`paper_sizing_reference()` 的 fx 取到 7.8457（与账户两币种净值比一致）。
+- **回归风险**：① auto 的 B 从此随盈亏变化（这正是本次目的），但模拟盘买力上限（20 股量级）仍可能是真约束；② 账本是新建的，**从 100,000 HKD 基准起算**，之前的历史盈亏不入账（如需改基准，用 `auto_equity.py reset --baseline`，旧账本自动备份）；③ 港美股同一账户共用一个权益链（符合账户语义），并行会话的交易都会计入。
+
 ### 新增（复盘「金额口径四情景 + 三项诊断」，2026-11-18 用户立）
 
 - **为什么改**：R 是无量纲的技能口径（`R = P / M`，M 为该笔实际净 max_loss）。买力上限会把仓位压缩、止损距又随结构变化，因此各笔 M 并不相同，`E[P] = E[R]·E[M] + Cov(R,M)` —— 直接用 `mean(R) × B` 估金额会系统性偏高。2026-11-17 美股实测：`mean(R)=0.27` 但 `mean(P)=US$6.62/笔`，若按 `0.27 × B(US$254.9)` 估算得 US$68.8/笔，高估约 10 倍（模拟账户买力只允许 20 股，每笔实际 M 仅 US$20–30）。用户要求复盘同时给出四种口径、逐条解释，并每次写进复盘文档。

@@ -238,6 +238,8 @@ def build_trades(orders):
             "entry": float(r.avg_fill_price or 0),
             "entry_time": getattr(r, "trade_time", None) or getattr(r, "order_time", None),
             "exit": float(exit_leg.avg_fill_price) if exit_leg and exit_leg.avg_fill_price else None,
+            # 平仓腿 order id：auto 权益账本（state/auto_equity.json）用它做幂等键，防重复入账
+            "exit_order_id": (str(getattr(exit_leg, "id", "")) or None) if exit_leg else None,
             "exit_time": (getattr(exit_leg, "trade_time", None) or getattr(exit_leg, "order_time", None)) if exit_leg else None,
             "pnl": float(getattr(exit_leg, "realized_pnl", 0) or 0) if exit_leg else 0.0,
             "stop_leg": float(getattr(stop_leg, "aux_price", 0) or 0) if stop_leg else None,

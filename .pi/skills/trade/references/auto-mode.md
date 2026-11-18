@@ -69,22 +69,24 @@
 
 **规则**：auto 模式下，只要下单账户是**模拟盘**（默认 17 位号 / `--account paper`），算仓位的全部风险基数一律取**纸面权益基准**、不碰实盘账户：
 
-1. **单笔预算 B / f_max / 市值上限用的 equity** = `signals/equity-log.csv` 末行**纸面权益**（与 signal 模式同源同机制；无记录回退 `config.risk.initial_equity`；**auto 模拟盘只读不写**——equity-log 仅由 signal 模式平仓与用户手动重设更新）；
+1. **单笔预算 B / f_max / 市值上限用的 equity** = **`state/auto_equity.json`（auto 模式独立权益账本，2026-11-18 用户立）**——`equity = 基准权益 + Σ 已平仓交易的实现盈亏（折 HKD）`，随每笔平仓**自动联动**（权益涨 → B 放大、跌 → B 缩），不需要任何人手动记账。**auto 与 signal 完全解耦、文件不复用**：signal 用 `signals/equity-log.csv`，auto 用这份账本，互不读取。机制 = `scripts/auto_equity.py`（幂等：按平仓腿 order id 去重；自愈：被动止损 / 会话中断漏记都会在下次 sync 自动补齐；每次都按「基准 + Σ已入账」重算，不靠增量所以不漂移）；基准取 `config.risk.auto_initial_equity`（缺省回退 `initial_equity`）；只认「账本建立之后才平仓」的交易，之前的平仓不进账。
 2. **总购买力** = 纸面权益折 USD × **模拟盘总融资杠杆**（2026-09-12 实测 4.0 倍；杠杆取自模拟盘自身 `get_assets` 的 `buying_power ÷ net_liquidation`，这是账户属性、不随资金量变，模拟盘就能拿到、不需要登入实盘；查询失败回退 `config.risk.paper_margin_leverage_default`，方向保守）；
 3. **单标的可买上限** = 总购买力 × `get_contract(symbol)` 的 `long_initial_margin` / `short_initial_margin`（模拟盘可查——美股实测 AAPL 0.30 / TQQQ 0.45；港股休市时段可能查不到，沿用 1.0 全额保守兜底，只会少开不会多开）；
 4. **USD↔HKD 汇率**（港股购买力折算、美股权益折算）= 模拟盘自身 `get_prime_assets` 的两币种比（老虎 forex_rate，2026-09-12 实测 7.8442；查询失败回退 7.80 保守常量）。
 
 **为什么（解耦动机）**：旧口径（2026-09-03 立）模拟盘算仓位须先取**实盘当日参考快照**（`state/live_reference.json`），快照缺失 / 非当日即 fail-closed 拒单——模拟盘与实盘资产**耦合**：实盘资产为 0 / 资金全部取出时快照刷不出购买力（fetch 拒绝写文件）、模拟盘无法交易。解耦后模拟盘链路零实盘依赖，实盘账户状态不再影响模拟盘交易。净 R 口径的可比性（2026-09-03 立规的原始动机：模拟盘资产量级远大于实盘 → 仓位档位差 → 固定费摊薄失真）改由**纸面权益基准**维持——纸面权益由用户维护在与实盘相当的量级（具体数值见本机权益账本），仓位档位与费占比的可比性不依赖实时实盘数值。
 
-**永不 fail-closed**：纸面权益永远取得到（equity-log 缺失回退 `initial_equity`）、杠杆与汇率查询失败回退保守默认值——模拟盘开仓不再有「缺实盘快照拒单」这一失败模式（旧 `blocked_by: "live_reference_required"` 拒单口径废止）。降级情况记入 `paper_sizing_reference()` 返回的 `degraded` 列表与开仓结果留痕。
+**永不 fail-closed**：账本缺失会按 config 自动创建（基准 = `auto_initial_equity` / `initial_equity`）、同步失败沿用上次已知值、杠杆与汇率查询失败回退保守默认值——模拟盘开仓不再有「缺快照拒单」这一失败模式（旧 `blocked_by: "live_reference_required"` 口径废止）。降级情况记入 `paper_sizing_reference()` 返回的 `degraded` 列表与开仓结果留痕。
 
 **实盘路径零改动**：`--account live` 执行时风险基数实时查实盘自身（2026-08-20「取净值与下单同账户」原样）、购买力查实盘 `get_assets`——解耦只改模拟盘分支。
 
 **旧机制退役**：实盘参考快照（`state/live_reference.json`）机制退役为诊断工具——`fetch_live_reference()` / `load_live_reference_checked()` / `--refresh-live-reference` CLI 保留（诊断实盘取数能力用），开仓 / preflight / resume 链路不再调用；preflight / resume 的「快照联动刷新」逻辑已删除。
 
-**开仓结果留痕**：港股 / 美股开仓脚本的 JSON 输出带 `sizing_source` 字段（模拟盘 =「signals/equity-log.csv 末行（纸面权益…）」、实盘 =「老虎实盘账户实时…」），AI 转录 `actions/` 记录时 B / equity 照实写。
+**开仓结果留痕**：港股 / 美股开仓脚本的 JSON 输出带 `sizing_source` 字段（模拟盘 =「state/auto_equity.json（auto 独立账本…）」、实盘 =「老虎实盘账户实时…」），AI 转录 `actions/` 记录时 B / equity 照实写（金额类只写派生指标，见项目 AGENTS.md）。
 
-**实现**：`trade_utils_tiger.py` 的 `paper_sizing_reference()`（一次调用返回 equity / fx / 杠杆 / 等效购买力，永不抛异常）、`auto_sizing_equity()` / `auto_sizing_equity_us()` / `auto_sizing_fx_hkd()`（模拟盘分支全部改走纸面基准）；美股版 `trade_utils_tiger_us.py` 同步。参数：`config.risk.paper_margin_leverage_default`（杠杆兜底 4.0）。
+**实现**：`trade_utils_tiger.py` 的 `paper_sizing_reference()`（一次调用返回 equity / fx / 杠杆 / 等效购买力，永不抛异常）、`auto_sizing_equity()` / `auto_sizing_equity_us()` / `auto_sizing_fx_hkd()`（模拟盘分支全部走 auto 账本）；权益账本本体在 `scripts/auto_equity.py`（CLI：`show` / `sync` / `reset --baseline`）；美股版 `trade_utils_tiger_us.py` 同步。参数：`config.risk.paper_margin_leverage_default`（杠杆兜底 4.0）、`config.risk.auto_initial_equity`（账本基准，缺省回退 `initial_equity`）。
+
+**⚠️ 与 signal 模式的边界（2026-11-18 用户立）**：两模式**完全独立、文件不复用**——signal 的 `signals/equity-log.csv` 由 AI 手动累加、auto 的 `state/auto_equity.json` 由脚本自动同步；任何一方都不要去读另一方的账本，也不要「为了统一口径」把两者合并。
 
 ---
 
