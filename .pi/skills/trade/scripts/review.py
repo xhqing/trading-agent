@@ -391,18 +391,28 @@ def _load_b_unit(currency, fx):
     # 16 字符内出现 4 位以上数字」，直接把 100000 写在 initial_equity 旁边会被误报）
     _FALLBACK_EQ = 100000.0
     init_eq = float(risk.get('initial_equity') or _FALLBACK_EQ)
-    eq_hkd, src = init_eq, 'config.initial_equity（equity-log 无记录）'
-    log_path = os.path.join(_PROJECT_ROOT, 'signals', 'equity-log.csv')
+    # 权益口径（2026-11-18 用户立：auto 与 signal 解耦）：auto 样本用 auto 独立账本，
+    # signal 样本用 equity-log。本函数拿不到 CSV 的模式上下文，优先用 auto 账本（当日真实
+    # 风险基数），读不到再退回 equity-log、最后退回 config。
+    eq_hkd, src = init_eq, 'config.initial_equity（账本均不可用）'
     try:
-        with open(log_path, encoding='utf-8') as f:
-            rows = [r for r in csv.DictReader(f) if (r.get('equity_after') or '').strip()]
-        if rows:
-            eq_hkd = float(rows[-1]['equity_after'])
-            src = f'equity-log 末行（{rows[-1].get("date", "")}）'
-    except FileNotFoundError:
-        src = 'config.initial_equity（equity-log 不存在，worktree 未链该私有文件？）'
-    except Exception as e:
-        src = f'config.initial_equity（equity-log 读取失败：{e}）'
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import auto_equity as _AE
+        _i = _AE.sync()
+        eq_hkd = float(_i['equity_hkd'])
+        src = 'state/auto_equity.json（auto 独立账本）'
+    except Exception:
+        log_path = os.path.join(_PROJECT_ROOT, 'signals', 'equity-log.csv')
+        try:
+            with open(log_path, encoding='utf-8') as f:
+                rows = [r for r in csv.DictReader(f) if (r.get('equity_after') or '').strip()]
+            if rows:
+                eq_hkd = float(rows[-1]['equity_after'])
+                src = f'signals/equity-log.csv 末行（{rows[-1].get("date", "")}，signal 账本）'
+        except FileNotFoundError:
+            src = 'config.initial_equity（equity-log 不存在）'
+        except Exception as e:
+            src = f'config.initial_equity（equity-log 读取失败：{e}）'
     b_hkd = rf * eq_hkd
     # ⚠️ 不把权益金额写进返回的说明文字：这段文字会随 --md-block 贴进 reviews/*.md（公开仓库），
     # 而账户资金类金额禁写进被跟踪文件（项目 AGENTS.md，2026-11-08 裁定）。B 本身是允许的派生指标。
@@ -534,6 +544,10 @@ def main():
     ap.add_argument('csv', help="已平仓交易清单 CSV 路径")
     ap.add_argument('--fx', type=float, default=7.84,
                     help="HKD/USD 汇率（美股样本换算 B 用；默认 7.84，可按当日实值传）")
+    ap.add_argument('--include-shadow', action='store_true',
+                    help="把 shadow=1 的影子样本并入主统计（2026-11-18 用户立：复盘要同时出"
+                         "「考虑影子 / 不考虑影子」两种口径；影子是决策时刻价近似、无真实滑点，"
+                         "并入时结论要标注不同质）")
     ap.add_argument('--md-block', action='store_true',
                     help="额外打印「金额口径四情景」的 Markdown 块（供复盘报告直接粘贴）")
     ap.add_argument('--fetch-futu', action='store_true',
@@ -582,9 +596,14 @@ def main():
         trades = _sub
     elif _n_shadow:
         _n_real = len(trades) - _n_shadow
-        print(f"【影子剔除】CSV 含 shadow=1 影子样本 {_n_shadow} 笔，主统计已剔除（剩真实样本 {_n_real} 笔）——"
-              f"影子单独跑：python3 review.py <csv> --mode shadow\n")
-        trades = [t for t in trades if not t['shadow']]
+        if args.include_shadow:
+            print(f"【影子并入】CSV 含 shadow=1 影子样本 {_n_shadow} 笔，已并入主统计"
+                  f"（真实 {_n_real} + 影子 {_n_shadow} = {len(trades)} 笔；影子为决策时刻价近似、"
+                  f"无真实滑点，与真实样本不同质，结论需标注）\n")
+        else:
+            print(f"【影子剔除】CSV 含 shadow=1 影子样本 {_n_shadow} 笔，主统计已剔除（剩真实样本 {_n_real} 笔）——"
+                  f"影子单独跑：python3 review.py <csv> --mode shadow；或并入：--include-shadow\n")
+            trades = [t for t in trades if not t['shadow']]
 
     if args.fetch_futu:
         try:
