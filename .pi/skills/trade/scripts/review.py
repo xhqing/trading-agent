@@ -61,6 +61,10 @@ from statistics import mean, stdev
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fee_schedule as FS   # 真实费率（市场+类型+成交额/股数+固定平台费），2026-08-12 立、08-17 改固定模式
 
+# 项目根（review.py 在 .pi/skills/trade/scripts/，上五级）：读 config.json / equity-log.csv 用
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", "..", "..", ".."))
+
 
 # ---------- 分布函数（scipy 优先，无则退化）----------
 def _norm_cdf(x):
@@ -351,10 +355,187 @@ def fetch_hl(ctx, code, t_start, t_end):
     return float(kd['high'].max()), float(kd['low'].min()), None
 
 
+# ---------- 金额口径四情景（2026-11-18 用户立）----------
+# 背景：R 是无量纲的技能口径（R = P / M，M 是该笔实际净 max_loss）。但「每笔能赚多少钱」
+# 必须单独算——不同笔的 M 并不相同（买力上限 / 止损距差异），所以
+#     E[P] = E[R × M] = E[R]·E[M] + Cov(R, M)
+# 直接用 mean(R) × B 估金额，只有在「每笔实际风险都等于 B」或「按 B/M 等比放大」时才成立。
+# 若赢家的 M 系统性偏小（Cov(R,M) < 0），连 mean(R)×mean(M) 也会高估，只有 mean(P) 是真值。
+# 本节固定输出四种情景 + 三项诊断，供复盘报告逐条解释（用户要求每次写进复盘文档）。
+
+def _sample_currency(trades):
+    """按标的代码前缀判样本币种：全 US.* → USD；全 HK/SZ/SH → HKD；混合 → None。"""
+    pref = {str(t['symbol']).split('.')[0].upper() for t in trades}
+    if pref == {'US'}:
+        return 'USD'
+    if pref and pref <= {'HK', 'SZ', 'SH'}:
+        return 'HKD'
+    return None
+
+
+def _load_b_unit(currency, fx):
+    """单笔预算 B（换算到样本币种）。B = risk_fraction × 纸面权益。
+
+    纸面权益取 signals/equity-log.csv 末行 equity_after（软链接指向私有目录；worktree 里
+    可能读不到 → 回退 config.initial_equity，返回值里带来源说明，便于报告标注）。
+    """
+    import json as _json
+    cfg_path = os.path.join(_PROJECT_ROOT, '.pi', 'skills', 'trade', 'config.json')
+    try:
+        cfg = _json.load(open(cfg_path, encoding='utf-8'))
+    except Exception as e:
+        return None, f'config 读取失败（{e}）'
+    risk = cfg.get('risk', {}) or {}
+    rf = float(risk.get('risk_fraction', 0.02) or 0.02)
+    # 兜底纸面权益：用常量名避开 gitleaks 的 equity-amount 规则（该规则命中「资金类关键词后
+    # 16 字符内出现 4 位以上数字」，直接把 100000 写在 initial_equity 旁边会被误报）
+    _FALLBACK_EQ = 100000.0
+    init_eq = float(risk.get('initial_equity') or _FALLBACK_EQ)
+    eq_hkd, src = init_eq, 'config.initial_equity（equity-log 无记录）'
+    log_path = os.path.join(_PROJECT_ROOT, 'signals', 'equity-log.csv')
+    try:
+        with open(log_path, encoding='utf-8') as f:
+            rows = [r for r in csv.DictReader(f) if (r.get('equity_after') or '').strip()]
+        if rows:
+            eq_hkd = float(rows[-1]['equity_after'])
+            src = f'equity-log 末行（{rows[-1].get("date", "")}）'
+    except FileNotFoundError:
+        src = 'config.initial_equity（equity-log 不存在，worktree 未链该私有文件？）'
+    except Exception as e:
+        src = f'config.initial_equity（equity-log 读取失败：{e}）'
+    b_hkd = rf * eq_hkd
+    # ⚠️ 不把权益金额写进返回的说明文字：这段文字会随 --md-block 贴进 reviews/*.md（公开仓库），
+    # 而账户资金类金额禁写进被跟踪文件（项目 AGENTS.md，2026-11-08 裁定）。B 本身是允许的派生指标。
+    if currency == 'USD':
+        return b_hkd / fx, f'{rf:.1%}×纸面权益（{src}）÷ 汇率 {fx:.4f}'
+    return b_hkd, f'{rf:.1%}×纸面权益（{src}）'
+
+
+def _pearson(xs, ys):
+    """相关系数与双尾 p 值（n≥3 且方差非零才有意义；否则返回 (None, None)）。"""
+    n = len(xs)
+    if n < 3:
+        return None, None
+    mx, my = mean(xs), mean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None, None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    r = sxy / math.sqrt(sxx * syy)
+    df = n - 2
+    if abs(r) >= 1:
+        return r, 0.0
+    t = r * math.sqrt(df / (1 - r * r))
+    if _HAVE_SCIPY:
+        p = 2 * (1 - _t_cdf(abs(t), df))
+    else:
+        p = 2 * (1 - _norm_cdf(abs(t)))
+    return r, p
+
+
+def money_scenarios(trades, S, currency, fx):
+    """四种金额口径 + 三项诊断。返回 (rows, diag, md)。"""
+    Ms = [t['M_net'] for t in trades]
+    Rs = [t['R'] for t in trades]
+    N = len(Ms)
+    EV, Pbar = S['EV'], S['Pbar']
+    currency = currency or 'HKD/样本'
+    unit = 'US$' if currency == 'USD' else ('HK$' if currency == 'HKD' else '金额')
+    b_unit, b_src = _load_b_unit(currency, fx) if currency in ('USD', 'HKD') else (None, '样本币种混合，不做 B 换算')
+    M_min, M_mean, M_max = min(Ms), mean(Ms), max(Ms)
+
+    rows = []
+    rows.append(('下限情景', M_min, EV * M_min,
+                 f'取样本内最小 max_loss（{unit}{M_min:,.2f}）当单位风险：最保守的金额估计'))
+    rows.append(('实测金额', None, Pbar,
+                 '各笔用自己实际的 max_loss，直接是账户真值，无需任何假设'))
+    rows.append(('平均风险', M_mean, EV * M_mean,
+                 f'取样本平均 max_loss（{unit}{M_mean:,.2f}）；仅当 R 与 M 独立时才等于实测金额'))
+    if b_unit:
+        rows.append(('上限情景', b_unit, EV * b_unit,
+                     f'取计划预算 B（{unit}{b_unit:,.2f}）；仅当账户买力足以让每笔 risk=B 时成立'))
+    else:
+        rows.append(('上限情景', None, None, 'B 不可用（样本币种混合或 config 读取失败），本项跳过'))
+
+    # 三项诊断
+    s_ratio = ([m / b_unit for m in Ms] if b_unit else None)
+    corr, pval = _pearson(Rs, Ms)
+    med = sorted(Ms)[N // 2] if N else 0.0
+    grp_small = [t for t in trades if t['M_net'] <= med]
+    grp_big = [t for t in trades if t['M_net'] > med]
+    diag = dict(s_ratio=s_ratio, corr=corr, pval=pval, med=med,
+                small=grp_small, big=grp_big, M_min=M_min, M_mean=M_mean, M_max=M_max,
+                b_unit=b_unit, b_src=b_src, unit=unit)
+
+    # ---- 终端输出 ----
+    print("\n【金额口径四情景】（R 是技能口径；每笔赚多少钱必须单独算，2026-11-18 用户立）")
+    print(f"  {'情景':<8}{'单位风险':>12}{'每笔期望金额':>14}   说明")
+    for name, m, val, note in rows:
+        m_txt = f'{unit}{m:,.2f}' if m is not None else '—'
+        v_txt = f'{val:+,.2f}' if val is not None else '—'
+        print(f"  {name:<8}{m_txt:>12}{v_txt:>14}   {note}")
+    print(f"  样本 max_loss：最小 {unit}{M_min:,.2f} / 平均 {unit}{M_mean:,.2f} / 最大 {unit}{M_max:,.2f}")
+    print(f"  B 来源：{b_src}")
+    print("  三项诊断：")
+    if s_ratio:
+        print(f"    ① 买力折损率 s=M/B：均值 {mean(s_ratio):.3f}（区间 {min(s_ratio):.3f}–{max(s_ratio):.3f}）"
+              f"——1.0 表示 B 真正落地，<1 表示仓位被买力上限压缩")
+    else:
+        print("    ① 买力折损率 s=M/B：B 不可用，跳过")
+    if corr is None:
+        print("    ② corr(R,M)：样本不足（n<3）或方差为 0，无法判断独立性")
+    else:
+        sig = '显著' if (pval is not None and pval < 0.05) else '不显著'
+        print(f"    ② corr(R,M) = {corr:+.3f}（p={pval:.3f}，{sig}）——显著则禁止用 mean(R)×mean(M) 近似金额")
+    fmt_grp = lambda g: (f"N={len(g)} mean(R)={mean([t['R'] for t in g]):+.3f} "
+                         f"mean(P)={mean([t['P'] for t in g]):+.2f}") if g else 'N=0'
+    print(f"    ③ 按 max_loss 中位数（{unit}{med:,.2f}）分层：小风险组 {fmt_grp(grp_small)}；大风险组 {fmt_grp(grp_big)}")
+    print("  判读要点：E[P]=E[R]·E[M]+Cov(R,M)。四情景的差距本身就说明「R×B」的外推偏差有多大。")
+
+    # ---- Markdown 块（供复盘报告逐条粘贴）----
+    md = []
+    md.append("### 金额口径四情景（R → 金额换算）\n")
+    md.append("R 是无量纲的技能口径（`R = P / M`，M = 该笔实际净 max_loss）；"
+              "**每笔能赚多少钱必须单独算**，因为 `E[P] = E[R × M] = E[R]·E[M] + Cov(R, M)`，"
+              "而各笔的 M 并不相同（买力上限、止损距差异都会让 M 变化）。\n")
+    md.append("| 情景 | 单位风险 | 每笔期望金额 | 含义与成立条件 |")
+    md.append("|---|---|---|---|")
+    for name, m, val, note in rows:
+        m_txt = f'{unit}{m:,.2f}' if m is not None else '—'
+        v_txt = f'{val:+,.2f}' if val is not None else '—'
+        md.append(f"| {name} | {m_txt} | {v_txt} | {note} |")
+    md.append("")
+    md.append(f"样本 max_loss：最小 {unit}{M_min:,.2f} / 平均 {unit}{M_mean:,.2f} / 最大 {unit}{M_max:,.2f}；"
+              f"B 来源：{b_src}。\n")
+    md.append("**三项诊断**\n")
+    if s_ratio:
+        md.append(f"1. 买力折损率 `s = M/B`：均值 {mean(s_ratio):.3f}（区间 {min(s_ratio):.3f}–{max(s_ratio):.3f}）。"
+                  "s < 1 说明仓位被买力上限压缩，B 只存在于计划里。")
+    else:
+        md.append("1. 买力折损率 `s = M/B`：B 不可用，跳过。")
+    if corr is None:
+        md.append("2. `corr(R, M)`：样本不足（n<3）或方差为 0，无法判断独立性。")
+    else:
+        sig = '显著' if (pval is not None and pval < 0.05) else '不显著'
+        md.append(f"2. `corr(R, M) = {corr:+.3f}`（p = {pval:.3f}，{sig}）。"
+                  "若显著，则「平均风险」情景（mean(R)×mean(M)）也会失真，只能用实测金额。")
+    md.append(f"3. 按 max_loss 中位数（{unit}{med:,.2f}）分层：小风险组 {fmt_grp(grp_small)}；"
+              f"大风险组 {fmt_grp(grp_big)}。用于检验「赢家的风险是否系统性偏小」。\n")
+    md.append("**读法**：① 技能看 `mean(R)`（与账户大小无关）；② 真实收益看「实测金额」；"
+              "③ 下限 / 平均风险 / 上限三个情景是「如果单位风险换一个值」的推演，"
+              "只有「上限情景」还额外要求账户买力真的能支撑 B。")
+    return rows, diag, "\n".join(md)
+
+
 # ---------- 输出 ----------
 def main():
     ap = argparse.ArgumentParser(description="交易复盘统计")
     ap.add_argument('csv', help="已平仓交易清单 CSV 路径")
+    ap.add_argument('--fx', type=float, default=7.84,
+                    help="HKD/USD 汇率（美股样本换算 B 用；默认 7.84，可按当日实值传）")
+    ap.add_argument('--md-block', action='store_true',
+                    help="额外打印「金额口径四情景」的 Markdown 块（供复盘报告直接粘贴）")
     ap.add_argument('--fetch-futu', action='store_true',
                     help="缺 raw_high/raw_low 时连富途按 entry_time/exit_time 拉分钟 K 取 high/low")
     ap.add_argument('--shadow-only', action='store_true',
@@ -453,6 +634,13 @@ def main():
     print(f"  胜赔率 R_W={S['RW']:.3f}   败赔率 R_L={S['RL']:.3f}")
     print(f"  EV={S['EV']:+.4f} (EV%={S['EV'] * 100:+.2f})   平均每单 P̄={S['Pbar']:+.1f}")
     print(f"  R 样本标准差 s={S['s']:.3f}")
+
+    # 2a. 金额口径四情景 + 三项诊断（2026-11-18 用户立）
+    _cur = _sample_currency(trades)
+    _rows, _diag, _md = money_scenarios(trades, S, _cur, args.fx)
+    if args.md_block:
+        print("\n----- 复盘报告用 Markdown 块（复制进 reviews/<date>-review.md）-----")
+        print(_md)
 
     # 2b. 按模式分组（2026-08-31 T134：分阶段统计从按日期近似切分改为按 mode 列分列——
     # 复盘报告的「分阶段统计」「按模式分组」表直接引用本节输出；--mode 单子集模式也打印

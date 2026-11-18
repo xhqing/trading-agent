@@ -269,7 +269,9 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 
 **数据源（2026-08-03 用户立：复盘交易 = signals/ + actions/ 两个目录的记录）**：复盘时遍历 **`signals/` + `actions/` 两个目录下的交易记录**——`signals/`（港股 `signals/YYYY-MM-DD-HKT-signals.md`、美股 `signals/YYYY-MM-DD-ET-signals.md`）记 signal 模式信号事实，`actions/`（港股 `actions/YYYY-MM-DD-HKT-actions.md`、美股 `actions/YYYY-MM-DD-ET-actions.md`）记 auto 模式实际成交动作（含 order_id、成交价）。**默认只遍历港股文件（`*-HKT-*`）**，美股文件（`*-ET-*`）按需纳入（见上段）。合并为样本逐笔算参数（入场价 / 止损 / 盈亏 / R-multiple）。⚠️ 防重复计数：同一笔交易只计一次——signal 与 auto 交易各记各的目录、互不重叠；若同一笔两处都有，以 `actions/` 实际成交记录为准；开仓失败 / 撤销 / 作废批次不计样本（记录上有明确标注）。⚠️ 每次复盘必须遍历所选范围内的全部文件、与现有 trades.csv 逐日对账（2026-08-03 教训：美股样本曾漏 3 笔，N 由 28 → 33），不许只补增量——默认只复盘港股时也要把所有港股 HKT 文件全量对账。
 
-**复盘工具**：`python3 scripts/review.py <trades.csv>` 一次性输出全套指标（样本明细、终局统计量、过程指标分盈亏单、贝叶斯 P(EV>0)、频率派 CI、样本量规划、**末尾实盘熔断核对段**——两级判据机械判读 + 熔断状态三态建议，2026-09-12 立）；`python3 scripts/bayes_evolution.py` 输出 7 张序贯演化图。复盘产物放 `reviews/`（报告 `reviews/YYYY-MM-DD-review.md` + 同日 csv/png）。
+**复盘工具**：`python3 scripts/review.py <trades.csv>` 一次性输出全套指标（样本明细、终局统计量、**金额口径四情景 + 三项诊断（2026-11-18 立，见下）**、过程指标分盈亏单、贝叶斯 P(EV>0)、频率派 CI、样本量规划、**末尾实盘熔断核对段**——两级判据机械判读 + 熔断状态三态建议，2026-09-12 立）；`python3 scripts/bayes_evolution.py` 输出 7 张序贯演化图。复盘产物放 `reviews/`（报告 `reviews/YYYY-MM-DD-review.md` + 同日 csv/png）。
+
+**⚠️ 金额口径四情景是复盘报告必含段（2026-11-18 用户立）**：R 只是技能口径，不能直接乘 B 当金额——`E[P] = E[R]·E[M] + Cov(R,M)`，买力上限 / 止损距都会让各笔 M 不同。报告必须写全四种情景（**下限情景** `mean(R)×M_min` / **实测金额** `mean(P)` / **平均风险** `mean(R)×mean(M)` / **上限情景** `mean(R)×B`）与三项诊断（`s=M/B`、`corr(R,M)`、按 M 分层），并逐条解释「本场为什么是这个数」。做法：`review.py <csv> --fx <HKD/USD> --md-block` 直接输出可粘贴的 Markdown 块，收尾前跑 `python3 scripts/check_review_scenarios.py reviews/<报告>.md` 校验，不通过与演化图缺失同级——不算复盘完成。口径定义与判读规则见 `references/review-and-evaluation.md`「金额口径四情景」节。
 
 **详细方法论见 `references/review-and-evaluation.md`**（收到复盘指令时读它）：统计量定义与推导（EV 分解合并恒等、MAE / MFE / 回吐 / 锁利效率 η）、7 张序贯演化图的必含规范、样本量规划、多层评估框架、**实盘熔断机制（两级判据 + 复盘结尾必含「暂停 / 重启实盘」三态建议 + 实盘开仓闸 + 重启流程，2026-08-17 立判据 / 2026-09-12 机制化）**。盯盘时不必读、复盘时按此逐项统计。
 
