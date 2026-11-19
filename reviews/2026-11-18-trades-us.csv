@@ -153,3 +153,11 @@ date,symbol,direction,entry_price,exit_price,shares,max_loss,type,mode,shadow
 2026-11-17,US.SPY,short,729.3300,729.1550,20,16.40,etf,auto_paper,0
 2026-11-17,US.SPY,long,733.1500,732.3200,20,19.00,etf,shadow,1
 2026-11-17,US.SPY,short,731.8200,731.7000,20,18.60,etf,shadow,1
+2026-11-18,US.AMD,short,501.7650,505.0000,35,113.23,stock,auto_paper,
+2026-11-18,US.SOXL,long,49.7050,49.5114,457,116.53,etf,auto_paper,
+2026-11-18,US.AMD,short,507.3100,510.3200,34,159.46,stock,auto_paper,
+2026-11-18,US.AMD,short,505.5500,508.5400,34,100.30,stock,auto_paper,
+2026-11-18,US.AMD,short,505.9499,507.3100,34,52.70,stock,auto_paper,
+2026-11-18,US.AMD,long,521.4300,519.9000,32,189.76,stock,auto_paper,
+2026-11-18,US.SOXL,short,49.1200,47.7725,429,227.37,etf,auto_paper,
+2026-11-18,US.SOXL,short,47.8500,48.1600,565,197.75,etf,auto_paper,

@@ -158,38 +158,43 @@ def replay(trades, full_loss_r):
     """重放实盘连败闸，返回 (逐笔标注, 反事实保留集)。
 
     逐笔标注 = [(t, would_block_label: bool)]；反事实保留集 = 真正「按实盘规则做出来」的笔。
-    两个序列都按交易日分组、组内按时序推进状态（连败计数跨日保留、但只有「最近一笔亏损
-    在同一交易日」时才拦——与 `check_losing_streak_gate` 的判据一致）。
+    两个序列都按交易日分组、**每个新交易日重新计数**（2026-11-18 用户立：闸是当日闸，
+    前一日连败不带入今日）——与 `trade_utils_tiger.losing_streak_would_block` 的判据一致。
+    样本已由 `--market` 参数按市场过滤，本函数不跨市场。
     """
     labelled, kept = [], []
-    streak, recent, last_loss_day = 0, [], None
+    streak, recent = 0, []
     cur_day = None
     for t in sorted(trades, key=sort_key):
         if t["date"] != cur_day:
             cur_day = t["date"]
+            streak, recent = 0, []          # 新交易日 → 重新计数
         triggered = (streak >= 3) or (streak >= 2 and len(recent) >= 2
                                       and all(x <= full_loss_r for x in recent[-2:]))
-        block_now = triggered and last_loss_day == cur_day
-        labelled.append((t, block_now))
+        labelled.append((t, triggered))
         # A. 标注口径：状态由实际发生的交易推进（样本就是这么产生的）
         if t["R"] < 0:
             streak += 1
             recent.append(t["R"])
-            last_loss_day = cur_day
+            recent = recent[-5:]
         else:
             streak, recent = 0, []
     # B. 反事实回放：被拦的笔既不计入、也不推进状态
-    streak, recent, last_loss_day = 0, [], None
-    for t, block_now in labelled:
+    streak, recent = 0, []
+    cur_day = None
+    for t, _ in labelled:
+        if t["date"] != cur_day:
+            cur_day = t["date"]
+            streak, recent = 0, []
         triggered = (streak >= 3) or (streak >= 2 and len(recent) >= 2
                                       and all(x <= full_loss_r for x in recent[-2:]))
-        if triggered and last_loss_day == t["date"]:
+        if triggered:
             continue                     # 实盘会拦：不成交、不推进状态
         kept.append(t)
         if t["R"] < 0:
             streak += 1
             recent.append(t["R"])
-            last_loss_day = t["date"]
+            recent = recent[-5:]
         else:
             streak, recent = 0, []
     return labelled, kept
@@ -245,8 +250,9 @@ def main():
     lines = ["# 复盘 EV 双口径报告（T199HKUS）", "",
              f"- 样本：{', '.join(os.path.basename(p) for p in paths)}"
              f"（mode ∈ {sorted(modes)}，剔除影子组）",
-             f"- 闸判据：连败 ≥3 笔，或连败 ≥2 笔且最近两笔净 R 均 ≤ {full_loss_r}"
-             f"（阈值来源：{threshold_src}），且最近一笔亏损在同一交易日",
+             f"- 闸判据：单市场当日连败 ≥3 笔，或当日连败 ≥2 笔且最近两笔净 R 均 ≤ {full_loss_r}"
+             f"（阈值来源：{threshold_src}）；每个交易日重新计数（港美各一条序列，本表只算 "
+             f"{a.market.upper()}）",
              f"- R 口径：review.py 的**净 R**（分母 = 开仓止损距×股数 + 开仓边费 + 止损价平仓边费），"
              f"不是 actions 里手写的数字——两边偶尔差几十个 bp，以本表为准",
              f"- 生成：`ev_dual_report.py`（{len(trades)} 笔；其中 {time_hits} 笔的开仓时序取自 "

@@ -530,6 +530,64 @@ def ip_switch_stats(market, trade_date, stag):
     return out
 
 
+def auto_review_block(market, date):
+    """跑自动复盘并取「实盘两闸状态」（T202HKUS，2026-11-18 用户立）。
+
+    用户原话：「加一个功能：每天停止盯盘后自动复盘，把复盘报告 MD 落盘，并汇报是否触发实盘的
+    两种闸（连败闸和熔断闸），这个自动复盘功能不论跑的是实盘还是模拟盘都要做」。
+
+    这里只负责调 `auto_review.py`（它自己落盘 `reviews/<date>-review-<market>.md` + 补样本库）
+    并把两闸状态翻译成**业务表述**（飞书只发业务内容，不得出现脚本 / 日志 / 会话等技术词）。
+    异常不阻断停盯收尾：返回一行「请人工核对」的提示。
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_review.py")
+    try:
+        r = subprocess.run([sys.executable, script, "--market", market, "--date", date],
+                           capture_output=True, text=True, timeout=420)
+        out = r.stdout or ""
+        raw = next((x for x in out.splitlines() if x.startswith("JSON=")), None)
+        if not raw:
+            return ["## 实盘两闸状态（自动复盘）", "",
+                    "⚠️ 本次自动复盘未产出状态，请人工核对两闸（连败闸 / 熔断闸）。"]
+        data = json.loads(raw[5:])
+    except Exception as e:
+        return ["## 实盘两闸状态（自动复盘）", "",
+                f"⚠️ 自动复盘异常（{type(e).__name__}），请人工核对两闸。"]
+
+    g = data.get("gates") or {}
+    l1, l2 = (g.get("L1") or {}), (g.get("L2") or {})
+    mkt = str(g.get("market") or market).upper()
+    L = ["## 实盘两闸状态（自动复盘）", ""]
+    # 二级优先（熔断重于降频）
+    if l2.get("status") == "tripped":
+        L.append(f"- ⛔ **二级熔断闸：熔断中**（{l2.get('tripped_at')} 触发）——明天起**实盘一律不开新仓**："
+                 f"要么不交易，要么只做模拟盘交易；直到模拟盘新样本 ≥{l2.get('resume_min_trades')} 笔、"
+                 f"段内 EV>0 且无三连败，再经确认后才可考虑重回实盘。")
+    elif l2.get("judged_triggered"):
+        L.append("- ⛔ **二级熔断闸：本次判据已触发**（胜率后验跌破 80% 且最近连续五笔无盈利）"
+                 "——按规则应熔断实盘：明天起实盘不开新仓、只做模拟盘，等重启判据达标。")
+    else:
+        pg = l2.get("pg_pos")
+        L.append(f"- ✅ 二级熔断闸：未触发"
+                 + (f"（长期胜率后验 {pg * 100:.1f}%，距 80% 预警线 {(pg - 0.8) * 100:+.1f} 个百分点）"
+                    if isinstance(pg, (int, float)) else ""))
+    if l1.get("triggered"):
+        L.append(f"- ⚠️ **一级连败闸：今日已触发**（{mkt} 当日连败 {l1.get('streak')} 笔）"
+                 f"——实盘当日不得再开新仓（模拟盘不受限）；次日重新计数、自动放行。")
+    else:
+        L.append(f"- ✅ 一级连败闸：未触发（{mkt} 当日连败 {l1.get('streak', 0)} 笔）")
+    rep = data.get("report")
+    if rep:
+        td = data.get("today") or {}
+        if td.get("N"):
+            tail = (f"当日 {td['N']} 笔、胜率 {td.get('win_pct', 0):.0f}%、"
+                    f"合计 {td.get('sum_R', 0):+.2f}R")
+        else:
+            tail = "当日 0 笔成交"
+        L.append(f"- 今日复盘报告已生成：{rep}（{tail}）")
+    return L
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", default="us", choices=["us", "hk"])
@@ -922,6 +980,15 @@ def main():
             else:
                 F.append(f"- {j}. {e['symbol']} {e['direction'] or ''}：{e['kind']}（未结算）")
     feishu_md = "\n".join(F)
+
+    # —— 自动复盘 + 两闸状态（T202HKUS，2026-11-18 用户立）——
+    # 每次停盯收尾都跑（实盘 / 模拟盘一样）；报告自身落盘 reviews/<date>-review-<market>.md。
+    _gate_lines = auto_review_block(a.market, date)
+    if _gate_lines:
+        F.extend([""] + _gate_lines)
+        feishu_md = "\n".join(F)
+        L.extend([""] + _gate_lines)
+        summary_md = "\n".join(L)
 
     if a.dry_run:
         print("\n=== 飞书业务版（dry-run，不发送）===")
