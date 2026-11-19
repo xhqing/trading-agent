@@ -776,13 +776,19 @@ def _circuit_breaker_check(csv_path):
     if not cfg.get("enabled", True):
         print("  ⚠️ 熔断机制已关（config risk.circuit_breaker.enabled=false）——仅报告判据数值，不下熔断建议")
     # 第一级 · 降频线：当前连败数（losing_streak.json，T131 闸已工具强制，这里只报告）
+    # 2026-11-18 口径：港美各一条序列、每日重新计数（旧扁平结构由 _migrate 自动迁移）
     try:
-        _ls = json.load(open(CB.state_path().parent / "losing_streak.json"))
-        _streak = int(_ls.get("streak", 0) or 0)
-        _ls_txt = (f"当前连败 {_streak} 笔（最近序列 {_ls.get('recent_r', [])}）→ "
-                   + ("触发（当日新开仓已被 T131 闸拦截）" if _streak >= 3 else "不触发"))
+        import trade_utils_tiger as _T
+        _ls = _T._migrate_losing_streak(json.load(open(CB.state_path().parent / "losing_streak.json")))
+        _parts = []
+        for _mk in ("HK", "US"):
+            _cell = _T._daily_streak_cell(_ls, _mk)
+            _s = int(_cell.get("streak", 0) or 0)
+            _parts.append(f"{_mk} 当日 {_s} 笔"
+                          + ("（触发）" if _T._losing_streak_triggered(_cell) else ""))
+        _ls_txt = "；".join(_parts) + "（港美各一条序列、每日重新计数）"
     except Exception:
-        _streak, _ls_txt = 0, "losing_streak.json 不存在（尚无平仓记录）→ 不触发"
+        _ls_txt = "losing_streak.json 不存在（尚无平仓记录）→ 不触发"
     print(f"  第一级 · 降频线：{_ls_txt}")
     # 第二级 · 暂停修整线：P(g>0)@f + 最近 N 笔有无盈利
     floor = float(cfg.get("pg_pos_floor", 0.80))
