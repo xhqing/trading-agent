@@ -36,6 +36,7 @@
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -158,12 +159,51 @@ def daily_rows(market, date, account="paper", known_types=None):
     return out
 
 
-def write_csv(path, rows):
+def _atomic_write_text(path, text):
+    """原子写：先写同目录 .tmp 再 os.replace（读者要么看到旧版、要么看到新版，不会读到半截）。"""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(CSV_HEADER + "\n")
-        for r in rows:
-            f.write(",".join(str(r.get(k, "")) for k in CSV_HEADER.split(",")) + "\n")
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class _ReviewLock:
+    """跨进程互斥（flock）：同一市场同一时刻只让一个会话跑「读旧样本 → 合并 → 写样本 → 写报告」。
+
+    为什么需要（2026-11-20 立）：停盯收尾由每个会话各自跑，两个会话几乎同时停时，
+    A 正在 `open(...,"w")` 截断重写累积样本 CSV、B 恰好 `read_rows()` → 读到半截文件，
+    合并后再写回就是**历史样本被截断**（累积库永久丢数据；且两闸判据吃错样本会误判）。
+    锁文件放 state/（不入库），拿不到锁时等待（阻塞），退出时自动释放。
+    """
+
+    def __init__(self, name="auto_review.lock"):
+        self.path = ROOT / "state" / name
+        self.fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = open(self.path, "a+")
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+        return False
+
+
+def write_csv(path, rows):
+    # 原子写（2026-11-20）：累积样本库被多个会话并发读写时，绝不能让读者看到半截文件
+    buf = [CSV_HEADER]
+    for r in rows:
+        buf.append(",".join(str(r.get(k, "")) for k in CSV_HEADER.split(",")))
+    _atomic_write_text(Path(path), "\n".join(buf) + "\n")
 
 
 def gates_status(market, date, csv_rows):
@@ -324,6 +364,12 @@ def main():
     ap.add_argument("--json-only", action="store_true", help="只输出两闸 JSON（不写报告）")
     a = ap.parse_args()
 
+    # 整段「读累积样本 → 合并 → 写样本 → 写报告」在跨进程锁内（多会话同时停盯时串行化）
+    with _ReviewLock(f"auto_review_{a.market}.lock"):
+        return _run(a)
+
+
+def _run(a):
     date = a.date or T.market_date_of(a.market)
     src = latest_csv(a.market)
     rows = read_rows(src)
@@ -359,7 +405,7 @@ def main():
         rep = build_report(g, stats_today, stats_all)
         rep_path = ROOT / "reviews" / f"{date}-review-{a.market}.md"
         rep_path.parent.mkdir(parents=True, exist_ok=True)
-        rep_path.write_text(rep, encoding="utf-8")
+        _atomic_write_text(rep_path, rep)
         print(f"✅ 复盘报告已落盘：{rep_path.relative_to(ROOT)}")
         print(f"✅ 样本库：{csv_path.relative_to(ROOT)}（本次新增 {added} 笔，累计 {len(merged)} 笔）")
         for line in advice(g):
