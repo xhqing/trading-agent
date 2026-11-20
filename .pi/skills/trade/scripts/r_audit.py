@@ -63,9 +63,10 @@ def _symbol(title, market):
 def action_opens():
     """解析全部 actions 开仓条目 → [{date, market, symbol, entry, stop, source}]。"""
     out = []
-    for path in sorted(glob.glob(str(ROOT / "actions" / "*-actions.md"))):
+    for path in sorted(set(glob.glob(str(ROOT / "actions" / "*-actions.md"))
+                           + glob.glob(str(ROOT / "actions" / "*-actions-*.md")))):
         base = os.path.basename(path)
-        m = re.match(r"(\d{4}-\d{2}-\d{2})-(HKT|ET)-actions\.md", base)
+        m = re.match(r"(\d{4}-\d{2}-\d{2})-(HKT|ET)-actions(?:-[0-9A-Za-z]+)?\.md", base)
         if not m:
             continue
         d, market = m.group(1), ("HK" if m.group(2) == "HKT" else "US")

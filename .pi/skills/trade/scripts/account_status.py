@@ -55,23 +55,36 @@ def _today_action_files():
     """
     today = date.today()
     out = []
-    hkt = os.path.join(_ACTIONS_DIR, f'{today.strftime("%Y-%m-%d")}-HKT-actions.md')
-    if os.path.exists(hkt):
-        out.append(hkt)
+    # 2026-11-20 起 actions 按会话分文件：这里只读【本会话】的文件（本会话分文件不存在时
+    # 回退旧单文件、兼容历史），否则会把并行会话的持仓当成自己的
+    # （2026-11-19 实录：本会话空仓，采样段却每 40 秒报一条别人的 AMD 持仓硬告警）。
+    try:
+        import actions_paths as _AP
+    except Exception:  # 极简环境（例如只拷了本文件）下退回旧命名
+        _AP = None
+
+    def _files(mkt, dstr):
+        if _AP is not None:
+            return _AP.own_or_legacy(mkt, dstr, _ACTIONS_DIR.rsplit(os.sep, 1)[0])
+        legacy = os.path.join(_ACTIONS_DIR, f'{dstr}-{"HKT" if mkt == "hk" else "ET"}-actions.md')
+        return [legacy] if os.path.exists(legacy) else []
+
+    out.extend(_files('hk', today.strftime("%Y-%m-%d")))
     et_files = []
     for back in range(7):
         d = today - timedelta(days=back)
-        p = os.path.join(_ACTIONS_DIR, f'{d.strftime("%Y-%m-%d")}-ET-actions.md')
-        if os.path.exists(p):
-            et_files.append(p)
+        p_list = _files('us', d.strftime("%Y-%m-%d"))
+        if p_list:
+            et_files.extend(p_list)
             # 配对文件 = 最新文件日期「前一天」的 ET 文件（若存在）：一个美股会话的记录
             # 最多落两个文件（会话日 D 与跨午夜后续写的 D+1）——最新文件可能是会话首段
             # （D，续写文件还没写）也可能是续写段（D+1，首段在 D），取「最新 + 前一天」
             # 两种情况都覆盖（同日无新会话时前一天文件就是同一会话首段）。
             d_prev = d - timedelta(days=1)
-            pp = os.path.join(_ACTIONS_DIR, f'{d_prev.strftime("%Y-%m-%d")}-ET-actions.md')
-            if os.path.exists(pp):
-                et_files.append(pp)
+            try:
+                et_files.extend(_files('us', d_prev.strftime("%Y-%m-%d")))
+            except Exception:
+                pass
             break
     out.extend(et_files)
     return out

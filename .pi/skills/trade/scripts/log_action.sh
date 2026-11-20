@@ -17,8 +17,10 @@
 #     mode      auto / signal，必填：auto 用当前时间戳、signal 读 ring-log 末行
 #
 # 行为：
-#   ① 把 stdin 交易动作内容 append 到 actions/YYYY-MM-DD-{HKT,ET}-actions.md
-#   （按 market 参数选后缀）
+#   ① 把 stdin 交易动作内容 append 到 actions/YYYY-MM-DD-{HKT,ET}-actions-<stag>.md
+#   （按 market 参数选后缀；stag = 本会话标识，2026-11-20 起一天一个市场按会话分文件，
+#     避免多会话写同一文件导致「A 提交后 B 继续追加 → 工作区又 dirty」的时序打架）
+#     拿不到 PI_SESSION_ID（人工终端手跑）时退回旧名 actions/YYYY-MM-DD-{HKT,ET}-actions.md
 #   ② 动作正文首行带时间戳——auto 模式 = 当前时间（下单时刻）；signal 模式读
 #      ring-log.csv 末行（= 拍板时刻），无则用当前时间。
 #
@@ -71,6 +73,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
 ACTIONS_DIR="$PROJECT_ROOT/actions"
 mkdir -p "$ACTIONS_DIR"
+# 会话标识（2026-11-20 立）：完整会话 id 去掉非字母数字（与 session_tag.session_tag() 同口径）；
+# 拿不到就留空 → 文件名不带后缀（退回旧单文件命名）。
+STAG="$(printf '%s' "${PI_SESSION_ID:-}" | tr -cd '0-9A-Za-z')"
 ACTION_FILE="$ACTIONS_DIR/$(date "+%Y-%m-%d")-${MARKET_SUFFIX}-actions.md"
 # 2026-10-13 修：ET 文件按美东交易日命名——北京日期跨午夜（次日 00:00 后）时本地日期已进
 # 次日，而美东仍在同一 ET 交易日（如北京 10-13 01:03 = 美东 10-12 13:03），原直接用本地
@@ -80,7 +85,11 @@ case "$MARKET" in
   et) ACTION_DATE="$(TZ=America/New_York date "+%Y-%m-%d")" ;;
   *)  ACTION_DATE="$(date "+%Y-%m-%d")" ;;
 esac
-ACTION_FILE="$ACTIONS_DIR/${ACTION_DATE}-${MARKET_SUFFIX}-actions.md"
+if [ -n "$STAG" ]; then
+  ACTION_FILE="$ACTIONS_DIR/${ACTION_DATE}-${MARKET_SUFFIX}-actions-${STAG}.md"
+else
+  ACTION_FILE="$ACTIONS_DIR/${ACTION_DATE}-${MARKET_SUFFIX}-actions.md"
+fi
 LOG_FILE="$PROJECT_ROOT/signals/ring-log.csv"
 
 # 时间戳：auto 模式直接用当前时间（下单时刻）；signal 模式读 ring-log 末行（= 拍板时刻）；

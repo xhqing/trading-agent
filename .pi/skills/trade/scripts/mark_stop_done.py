@@ -125,11 +125,17 @@ def main(argv=None):
     except ImportError:
         print("⚠️ 无法加载 monitor_guard，跳过判据复核（标记已写入 state/）", file=sys.stderr)
 
-    acts = os.path.join(root, "actions", f"{a.date}-ET-actions.md" if a.market == "us"
-                        else f"{a.date}-HKT-actions.md")
-    if os.path.exists(acts):
+    # 2026-11-20 起 actions 按会话分文件：取该日该市场的全部文件（旧单文件 + 各会话分文件）
+    try:
+        import actions_paths as _AP
+        _acts = _AP.day_files(a.market, a.date, root)
+    except Exception:
+        _legacy = os.path.join(root, "actions", f"{a.date}-ET-actions.md" if a.market == "us"
+                               else f"{a.date}-HKT-actions.md")
+        _acts = [_legacy] if os.path.exists(_legacy) else []
+    if _acts:
         try:
-            txt = open(acts, encoding="utf-8").read()
+            txt = "\n".join(open(p, encoding="utf-8").read() for p in _acts)
             from session_tag import session_matches
             found = re.finditer(r"🆔\s*会话\s*[：:]\s*([0-9a-zA-Z]+)", txt)
             if any(session_matches(m.group(1), stag) for m in found):

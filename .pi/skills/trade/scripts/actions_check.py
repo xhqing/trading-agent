@@ -27,6 +27,7 @@
 （resume 场景由 AI 读输出处置；monitor_unregister 场景靠非零退出码醒目警示。）
 """
 
+import datetime
 import json
 import os
 import re
@@ -144,13 +145,28 @@ def main():
     # 会让昨夜开仓的记录整个缺席、闭环检查对美股跨午夜仓位失明）；market 标签仍按
     # 文件名后缀判定，不受影响。
     today = date.today().strftime("%Y-%m-%d")
+    # 2026-11-20 起 actions 按会话分文件：校验器要看该日的【全部】文件（旧单文件 + 各会话分文件）。
+    # 注意两个市场的「交易日」口径不同：美股按美东日期（北京凌晨仍是前一个 ET 交易日），
+    # 港股按北京日期——各自取各自的日期，不能都用本地日期。
     try:
-        import account_status as _AS
-        files = _AS._today_action_files()
+        from zoneinfo import ZoneInfo
+        _today_us = datetime.datetime.now().astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     except Exception:
-        files = [os.path.join(ACTIONS_DIR, f"{today}-{tag}-actions.md")
-                 for tag in ("HKT", "ET")]
-        files = [f for f in files if os.path.exists(f)]
+        _today_us = today
+    try:
+        import actions_paths as AP
+        files = []
+        files.extend(AP.day_files("hk", today, os.path.dirname(ACTIONS_DIR)))
+        files.extend(AP.day_files("us", _today_us, os.path.dirname(ACTIONS_DIR)))
+        files = sorted(set(files))
+    except Exception:
+        try:
+            import account_status as _AS
+            files = _AS._today_action_files()
+        except Exception:
+            files = [os.path.join(ACTIONS_DIR, f"{today}-{tag}-actions.md")
+                     for tag in ("HKT", "ET")]
+            files = [f for f in files if os.path.exists(f)]
     if not files:
         print("✅ 当日（含美股跨午夜回看）无 actions 文件——无 auto 交易记录，闭环检查通过。")
         sys.exit(0)

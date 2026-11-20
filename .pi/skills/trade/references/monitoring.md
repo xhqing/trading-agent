@@ -134,7 +134,7 @@
 - **平仓** `python3 scripts/close_position_tiger.py HK.00700`（美股用 `close_position_tiger_us.py`）— 一键平仓（不给方向/量则自动读持仓）；**主路径 = 把持仓止损单触发价 modify 为现价、止损单立即触发市价平仓**（无「撤止损 + 市价单」两步、无 race）；无活动止损单才直接市价单；modify 失败 / 未触发 fallback 撤止损 + 市价单。平仓后不残留未触发止损单。
 - **移动止损** `python3 scripts/move_stop_tiger.py HK.00700 long 484 100`（美股用 `move_stop_tiger_us.py`）— 把现有止损单触发价 modify 到新止损价、保留单个活动止损（港美同路径，2026-08-05 实测；无活动止损才补下新 STP、modify 失败 fallback 先下新再撤旧）。**持仓硬闸（2026-11-17 立，T198）**：提交前必须确认「持仓在场 + 方向一致 + 数量严格相等 + 触发价未穿越最新价（提交前再取一次最新价复核）」，任一不满足直接拒单（`ok:false` + 退出码 1）、不提交任何单——空仓下「补保护」分支补出来的 STP 就是一张会成交的开仓单（2026-11-16 实录：凭空开出 24 股裸多）。被拒时不要绕：先核实持仓，真的空仓就什么都不做。**2026-11-17（T201）再加固**：持仓改为**二次读取**（间隔 0.8 秒，两次不一致再等 1.2 秒读第三次，仍翻转即拒单），并做**当日订单流交叉核对**——账户说持仓在场、但当日该标的净成交为 0 且最后一笔是平仓方向、数量正好等于持仓量时，判定为「持仓接口滞后」直接拒单（2026-11-16 事故就是刚平完 8 秒内去移损）。移盈 `move_target_*` 同款硬闸（补挂止盈 LMT 同样会凭空开仓）。
 - **共用工具库** `python3 -c "from trade_utils_tiger import ..."` — 老虎 API 封装、价格范围计算（`calc_entry_range`）、仓位计算（`calc_position_size`）。
-- **记录交易动作** `cat <<'ACTION' | bash .pi/skills/trade/scripts/log_action.sh` — 写入 `actions/YYYY-MM-DD-<market>-actions.md`，内容经 stdin 传入，自动带时间戳。
+- **记录交易动作** `cat <<'ACTION' | bash .pi/skills/trade/scripts/log_action.sh` — 写入 `actions/YYYY-MM-DD-<market>-actions-<stag>.md`（本会话分文件；无会话标识时退回 `…-actions.md`），内容经 stdin 传入，自动带时间戳。
 - **资金流 / 行情**：盯盘资金流走富途 `get_capital_flow`、盘口 `get_order_book`、快照 `get_market_snapshot`（见 `references/account-tools.md` 数据源分工总则）。
 - ⚠️ **富途符号格式 = `市场.代码` 前缀**（`HK.02800`/`US.SPY`），美股写裸 `SPY` 报 `format of code SPY is wrong`（实测）。写脚本统一用前缀格式。
 

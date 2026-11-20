@@ -124,8 +124,12 @@ def daily_rows(market, date, account="paper", known_types=None):
     orders, _masked = SS.fetch_orders(market, account, start, end)
     pairs = [t for t in SS.build_trades(orders) if t.get("entry_filled") and t.get("exit")]
 
-    suffix = "ET" if market == "us" else "HKT"
-    orig = SS.original_stops(str(ROOT / "actions" / f"{date}-{suffix}-actions.md"))
+    # 2026-11-20 起 actions 按会话分文件：原始止损要扫该日该市场的全部文件
+    # （旧单文件 + 各会话分文件），再按「同标的 + 开仓价最接近」匹配。
+    import actions_paths as _AP
+    orig = []
+    for _fp in _AP.day_files(market, date, str(ROOT)):
+        orig.extend(SS.original_stops(_fp))
 
     out = []
     for t in pairs:
