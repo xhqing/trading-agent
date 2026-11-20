@@ -57,6 +57,24 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from session_tag import session_tag, session_matches, is_legacy
+import actions_paths as AP  # actions 文件命名规则（2026-11-20 起按会话分文件）
+
+
+def day_actions_files(market, date, root=None):
+    """该日该市场的全部 actions 文件（旧单文件 + 各会话分文件）。
+
+    跨会话查询口径：按成交价匹配原始止损、判断该日是否已写总结这类场景需要看全部
+    文件；而「哪笔属于本会话」仍由内容里的 🆔 会话 标记过滤（owned_entries）。
+    """
+    return AP.day_files(market, date, root or project_root())
+
+
+def _merge(fn, paths, *args):
+    """对一组 actions 文件逐个调用解析函数并合并结果。"""
+    out = []
+    for p in paths:
+        out.extend(fn(p, *args))
+    return out
 
 ET = ZoneInfo("America/New_York")
 BJ = ZoneInfo("Asia/Shanghai")
@@ -132,8 +150,7 @@ def detect_market_for_session():
     for back in range(0, 2):
         d = (datetime.now(BJ) - timedelta(days=back)).strftime("%Y-%m-%d")
         for suffix in ("ET", "HKT"):
-            fp = os.path.join(root, "actions", f"{d}-{suffix}-actions.md")
-            if os.path.exists(fp):
+            for fp in AP.day_files("us" if suffix == "ET" else "hk", d, root):
                 candidates.append(fp)
     found = []
     for fp in candidates:
@@ -645,8 +662,8 @@ def main():
         # 01a1c0e1 本场 0 笔真实成交，旧逻辑退化为全账户，把并行的 01a1c0e4 的 3 笔
         # 报成了本场战绩，用户收到「总体成果」后又补发了一条口径更正）。
         suffix_s = "ET" if a.market == "us" else "HKT"
-        _ap = os.path.join(root, "actions", f"{date}-{suffix_s}-actions.md")
-        owned = owned_entries(_ap, stag)
+        # 2026-11-20 起按会话分文件：扫该日该市场的全部文件，再用 🆔 会话 标记归到本会话
+        owned = _merge(owned_entries, day_actions_files(a.market, date, root), stag)
         if owned:
             kept = []
             for t in trades:
@@ -666,9 +683,9 @@ def main():
     print(f"账户 {masked}｜订单 {len(orders)} 条｜成笔 {len(trades)} 笔")
 
     suffix0 = "ET" if a.market == "us" else "HKT"
-    acts_path = os.path.join(root, "actions", f"{date}-{suffix0}-actions.md")
-    orig = original_stops(acts_path)
-    recs = parse_open_records(acts_path)
+    _acts_all = day_actions_files(a.market, date, root)
+    orig = _merge(original_stops, _acts_all)
+    recs = _merge(parse_open_records, _acts_all)
 
     rows = []
     total_pnl = 0.0
@@ -1000,9 +1017,9 @@ def main():
     # 步骤 2 飞书文件先引用导致 UnboundLocalError 崩溃）
     mid = f"_{stag}" if stag else ""
 
-    # 1) 追加进 actions 文件
+    # 1) 追加进 actions 文件（2026-11-20 起写本会话分文件，不再与并行会话抢同一份）
     suffix = "ET" if a.market == "us" else "HKT"
-    actions_path = os.path.join(root, "actions", f"{date}-{suffix}-actions.md")
+    actions_path = AP.write_path(a.market, date, root)
     os.makedirs(os.path.dirname(actions_path), exist_ok=True)
     _exists_same = False
     if os.path.exists(actions_path):

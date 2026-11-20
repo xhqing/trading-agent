@@ -314,8 +314,7 @@ def _us_wrapup_check():
         # 收尾标记在 = 该交易日已收尾（无论 signals / actions 里写了什么），不再逐文件报警。
         if _stop_done_recorded(_root, _d):
             continue
-        for _dir, _name in (("signals", f"{_d.isoformat()}-ET-signals.md"),
-                            ("actions", f"{_d.isoformat()}-ET-actions.md")):
+        for _dir, _name in (("signals", f"{_d.isoformat()}-ET-signals.md"),):
             _fp = _os.path.join(_root, _dir, _name)
             try:
                 _txt = open(_fp, encoding="utf-8").read()
@@ -328,6 +327,34 @@ def _us_wrapup_check():
                 else:
                     print(f"⏹️ 美股收尾提醒：{_d.isoformat()} ET 的 {_dir}/{_name} 尚无停盯总结——当日收尾"
                           f"最迟美东 24:00（夏令时北京次日 12:00 / 冬令时次日 13:00）前完成")
+        # 2026-11-20 起 actions 按会话分文件：看该日【全部】actions 文件（旧单文件 +
+        # 各会话分文件）——有动作记录且没有任何一个文件写了停盯总结时才提醒。
+        try:
+            import actions_paths as _AP
+            _acts = _AP.day_files("us", _d.isoformat(), _root)
+        except Exception:
+            _acts = []
+        if not _acts:
+            continue
+        _has_open = False
+        for _fp in _acts:
+            try:
+                if "🟢🟢🟢 开仓" in open(_fp, encoding="utf-8").read():
+                    _has_open = True
+                    break
+            except Exception:
+                continue
+        if not _has_open:
+            continue
+        if any("停盯总结" in open(_fp, encoding="utf-8").read() for _fp in _acts):
+            continue
+        _names = ", ".join(_os.path.basename(p) for p in _acts)
+        if _passed:
+            print(f"🚨 美股收尾已过截止线：{_d.isoformat()} ET 的 actions 有开仓记录但无停盯总结"
+                  f"（{_names}）——立即补写")
+        else:
+            print(f"⏹️ 美股收尾提醒：{_d.isoformat()} ET 的 actions 尚无停盯总结（{_names}）——"
+                  f"最迟美东 24:00 前完成")
 
 _us_wrapup_check()
 
@@ -354,8 +381,14 @@ def _feishu_check():
     _root = _os.path.abspath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                                           "..", "..", "..", ".."))
     _has_summary = False
-    for _dir, _name in (("signals", f"{_d.isoformat()}-ET-signals.md"),
-                        ("actions", f"{_d.isoformat()}-ET-actions.md")):
+    _cands = [("signals", f"{_d.isoformat()}-ET-signals.md")]
+    # 2026-11-20 起 actions 按会话分文件：把该日全部 actions 文件都纳入（旧单文件 + 各会话）
+    try:
+        import actions_paths as _AP
+        _cands += [("actions", _os.path.basename(p)) for p in _AP.day_files("us", _d.isoformat(), _root)]
+    except Exception:
+        _cands.append(("actions", f"{_d.isoformat()}-ET-actions.md"))
+    for _dir, _name in _cands:
         try:
             if "停盯总结" in open(_os.path.join(_root, _dir, _name), encoding="utf-8").read():
                 _has_summary = True

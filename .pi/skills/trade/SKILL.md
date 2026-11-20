@@ -74,7 +74,7 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 
 **停盯时怎么收尾**：盯盘产生的 `actions/` `signals/` 改动都在 worktree 分支上，停盯总结写完后在该 worktree 里走 `/add` → `/commit`（非 main 分支，自动触发允许）→ push → PR → 合并；合并后 `git worktree remove <路径>` 清理。**全程不回主工作区提交。**
 
-**多会话共用同一个 worktree（2026-11-06 补充事实，不是新规矩）**：worktree 按「市场 + 交易日」划分、**不按会话**——同一天同一市场开的多个会话都落在同一个 `<仓库名>-watch-<日期>-<市场>` 里（启动器幂等复用，不重复建），只有港 / 美两个市场、或某会话本来就在别的 worktree 里（如跨夜还在用前一天的）才会分成两个。会话之间靠这些机制隔离，不要用「多开 worktree」去隔离：`🆔 会话：<stag>` 行（`actions/` 里每条动作的归属，`log_action.sh` 自动写；`stag` = 完整会话 id 去掉连字符，2026-11-11 起不再截前 8 位）、`state/pool_claims.json`（标的池互斥，不许两会话盯同一标的）、`state/trade_mutex.lock`（单持仓互斥）、以及按会话分文件的 `tmp/` 痕迹（分析心跳 / 方向重估标记 / 飞书发送标记）。**别把 worktree 当会话隔离手段**：同一 `actions/<日期>-<市场>-actions.md` 若分到两个分支各写一遍，合并时必然冲突（2026-11-06 实测 `git merge-file` 退出码 1）。
+**多会话共用同一个 worktree（2026-11-06 补充事实，不是新规矩）**：worktree 按「市场 + 交易日」划分、**不按会话**——同一天同一市场开的多个会话都落在同一个 `<仓库名>-watch-<日期>-<市场>` 里（启动器幂等复用，不重复建），只有港 / 美两个市场、或某会话本来就在别的 worktree 里（如跨夜还在用前一天的）才会分成两个。会话之间靠这些机制隔离，不要用「多开 worktree」去隔离：`🆔 会话：<stag>` 行（`actions/` 里每条动作的归属，`log_action.sh` 自动写；`stag` = 完整会话 id 去掉连字符，2026-11-11 起不再截前 8 位）、**`actions/` 按会话分文件**（2026-11-20 起：`actions/<日期>-<市场>-actions-<stag>.md`，各会话各写自己的文件，不再抢同一份）、`state/pool_claims.json`（标的池互斥，不许两会话盯同一标的）、`state/trade_mutex.lock`（单持仓互斥）、以及按会话分文件的 `tmp/` 痕迹（分析心跳 / 方向重估标记 / 飞书发送标记）。**别把 worktree 当会话隔离手段**：`signals/<日期>-<市场>-signals.md` 这类仍按「一天一份」共享的文件若分到两个分支各写一遍，合并时必然冲突（2026-11-06 实测 `git merge-file` 退出码 1）。
 
 ### 模式路由
 
@@ -225,7 +225,7 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 > `realized_pnl`、修正 max_loss 用 fee_schedule 实算、**原始止损从 actions 开仓记录取**——
 > 止损腿的 aux_price 会被移损改掉，用它算会把赔率算虚高）；② 自动生成**北京日期对照表**
 > （老虎 App 按北京日期分组，跨北京午夜时同一交易日会被拆成两天，对账先看这张表）；③ 把
-> 停盯总结追加进 `actions/<date>-<market>-actions.md`（已有则跳过，防重复）；④ 生成并推送
+> 停盯总结追加进 `actions/<date>-<market>-actions-<stag>.md`（本会话分文件，已有则跳过，防重复）；④ 生成并推送
 > 飞书业务版，成功后写收尾标记 `tmp/stop_done_<market>_<et_date>.txt`。
 > **AI 只负责补「要点与教训」段落**，不要手写明细表与统计（手写必错、必漏）。
 > 🔁 **同一脚本还会自动跑当日复盘（2026-11-18 用户立，T202HKUS，实盘/模拟盘都跑）**：
@@ -272,7 +272,7 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 
 **默认复盘范围 = 港股，美股默认不复盘（2026-08-13 用户立）**：以后复盘**默认只复盘港股数据**（`signals/*-HKT-*.md` + `actions/*-HKT-*.md`），**默认不复盘美股数据**（`signals/*-ET-*.md` + `actions/*-ET-*.md`）。只有用户**明确说要复盘美股**（如「也复盘一下美股」「美股一起看」）时，才把美股数据纳入复盘。
 
-**数据源（2026-08-03 用户立：复盘交易 = signals/ + actions/ 两个目录的记录）**：复盘时遍历 **`signals/` + `actions/` 两个目录下的交易记录**——`signals/`（港股 `signals/YYYY-MM-DD-HKT-signals.md`、美股 `signals/YYYY-MM-DD-ET-signals.md`）记 signal 模式信号事实，`actions/`（港股 `actions/YYYY-MM-DD-HKT-actions.md`、美股 `actions/YYYY-MM-DD-ET-actions.md`）记 auto 模式实际成交动作（含 order_id、成交价）。**默认只遍历港股文件（`*-HKT-*`）**，美股文件（`*-ET-*`）按需纳入（见上段）。合并为样本逐笔算参数（入场价 / 止损 / 盈亏 / R-multiple）。⚠️ 防重复计数：同一笔交易只计一次——signal 与 auto 交易各记各的目录、互不重叠；若同一笔两处都有，以 `actions/` 实际成交记录为准；开仓失败 / 撤销 / 作废批次不计样本（记录上有明确标注）。⚠️ 每次复盘必须遍历所选范围内的全部文件、与现有 trades.csv 逐日对账（2026-08-03 教训：美股样本曾漏 3 笔，N 由 28 → 33），不许只补增量——默认只复盘港股时也要把所有港股 HKT 文件全量对账。
+**数据源（2026-08-03 用户立：复盘交易 = signals/ + actions/ 两个目录的记录）**：复盘时遍历 **`signals/` + `actions/` 两个目录下的交易记录**——`signals/`（港股 `signals/YYYY-MM-DD-HKT-signals.md`、美股 `signals/YYYY-MM-DD-ET-signals.md`）记 signal 模式信号事实，`actions/`（港股 `actions/YYYY-MM-DD-HKT-actions.md`、美股 `actions/YYYY-MM-DD-ET-actions.md`；**2026-11-20 起按会话分文件** `…-actions-<stag>.md`，旧单文件保留兼容、读侧一律两种都扫）记 auto 模式实际成交动作（含 order_id、成交价）。**默认只遍历港股文件（`*-HKT-*`）**，美股文件（`*-ET-*`）按需纳入（见上段）。合并为样本逐笔算参数（入场价 / 止损 / 盈亏 / R-multiple）。⚠️ 防重复计数：同一笔交易只计一次——signal 与 auto 交易各记各的目录、互不重叠；若同一笔两处都有，以 `actions/` 实际成交记录为准；开仓失败 / 撤销 / 作废批次不计样本（记录上有明确标注）。⚠️ 每次复盘必须遍历所选范围内的全部文件、与现有 trades.csv 逐日对账（2026-08-03 教训：美股样本曾漏 3 笔，N 由 28 → 33），不许只补增量——默认只复盘港股时也要把所有港股 HKT 文件全量对账。
 
 **复盘工具**：`python3 scripts/review.py <trades.csv>` 一次性输出全套指标（样本明细、终局统计量、**金额口径四情景 + 三项诊断（2026-11-18 立，见下）**、过程指标分盈亏单、贝叶斯 P(EV>0)、频率派 CI、样本量规划、**末尾实盘熔断核对段**——两级判据机械判读 + 熔断状态三态建议，2026-09-12 立）；`python3 scripts/bayes_evolution.py` 输出 7 张序贯演化图。复盘产物放 `reviews/`（报告 `reviews/YYYY-MM-DD-review.md` + 同日 csv/png）。
 
@@ -324,7 +324,7 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 
 1. **`date` 核实真实时间 + 算「距上次活动的时间差」**——上次活动时间 = `tmp/monitor_log_*.csv` 最后采样时间；距现在 ≥ 5 分钟 → 输出 ⚠️ 断层警告。
 2. **判市场状态决定能否执行**：港股盘中（北京 09:30-12:00 / 13:00-16:00）或美股可交易时段（美东 04:00-16:00，盘前 + 盘中，2026-08-18 立规）才允许执行（auto 下单 / signal 发信号）；港股盘前 / 美股盘前 04:00 之前 / 盘外 / 收盘后停止盯盘，不执行。
-3. **从文件重建上下文**（不靠内存）：读今日交易记录文件（auto 读 `actions/YYYY-MM-DD-<market>-actions.md` / signal 读 `signals/YYYY-MM-DD-<market>-signals.md`）确认当前持仓状态（开仓记录 + 入场价 + 止损 + 止盈）；读 equity 来源（auto 模拟盘读 `state/auto_equity.json`、auto 实盘读券商账户 API、signal 读 `signals/equity-log.csv`）确认当前 equity（算单笔预算 B）。
+3. **从文件重建上下文**（不靠内存）：读今日交易记录文件（auto 读 `actions/YYYY-MM-DD-<market>-actions*.md`（含本会话分文件与旧单文件）/ signal 读 `signals/YYYY-MM-DD-<market>-signals.md`）确认当前持仓状态（开仓记录 + 入场价 + 止损 + 止盈）；读 equity 来源（auto 模拟盘读 `state/auto_equity.json`、auto 实盘读券商账户 API、signal 读 `signals/equity-log.csv`）确认当前 equity（算单笔预算 B）。
 4. **`snapshot` 刷新所有相关标的现价**——断层前的价一律作废。
 5. **处理断层期间的持仓变化**：断层期间持仓可能被动触发止损（现价越过止损位）→ 标注「大概率被动触发、待盘后回查确认」，盘后用历史 K 线精确回查、更新 equity。
 

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### 变更（actions 记录按会话分文件，2026-11-20 用户立，T203HKUS）
+
+- **为什么改**：`actions/<date>-<market>-actions.md` 一直是「一天一个市场一份」，同一天同一市场的多个盯盘会话（最多见过的场景：两个会场）全会往里写。两个后果：① **提交时序打架**——A 会话 commit 时只快照了当时内容，B 会话随后继续追加，工作区立刻又变 dirty（2026-11-19 美股实录：#151 提交后 `actions/2026-11-19-ET-actions.md` 又出现未提交改动，最后由 B 自己的 #152 入库）；② **持仓推导串台**——`account_status.py` 从当日文件推导「本会话是否持仓」，会把别的会话的开仓当成自己的（同日实录：本会话空仓，采样段却每 40 秒报一条别人 AMD 持仓的硬告警）。
+- **改了什么**：
+  1. 新增 `scripts/actions_paths.py`（唯一命名口径）：写 = `actions/<date>-<market>-actions-<stag>.md`（`stag` 为 `session_tag()`，拿不到会话标识时退回旧名，手工场景行为不变）；读分三档——`own_or_legacy()`（本会话口径：本会话分文件存在就只读它，否则回退旧单文件）、`day_files()`（该日该市场旧单文件 + 全部会话分文件，用于跨会话查询）、`all_files()` / `parse_name()`（历史全库扫描）。
+  2. **写侧**：`log_action.sh` 文件名带 `<stag>`；`stop_summary.py` 的停盯总结追加进本会话分文件（防重复判定同步只认本会话）。
+  3. **读侧按「本会话口径」改**：`account_status.py`（持仓推导用本会话文件，修串台告警）、`hooks/monitor_guard.py`（停盯收尾检查，ET / HKT 两处）、`preflight.py`（美股收尾检查与飞书漏发检查改为「该日全部 actions 文件里有没有停盯总结」）、`mark_stop_done.py`（复核用该日全部文件）。
+  4. **读侧按「该日/全量口径」改**：`stop_summary.py`（原始止损、开仓记录、会话归属统计改为合并该日全部文件；`auto_review.py` 同步）、`actions_check.py`（校验该日全部文件）、`r_audit.py` / `ev_dual_report.py` / `r_phases_chart.py`（历史 glob 与文件名正则放宽到 `…-actions[-<stag>].md`）。
+  5. 文档同步：`SKILL.md`（多会话隔离机制、停盯总结、复盘数据源、resume 重建上下文）、`references/auto-mode.md`、`references/monitoring.md`、`references/review-and-evaluation.md` 四处文件名口径改为带 `-<stag>`，并注明「旧单文件保留兼容、读侧两种都扫」。
+- **回归风险**：低。旧文件**永不改名、不迁移**，读侧全部保留回退分支；`log_action.sh` 无 `PI_SESSION_ID` 时仍写旧名；`actions_check.py` / `r_audit.py` 等历史扫描两种命名都覆盖。唯一行为变化是「新产生的记录落在分文件里」——依赖固定文件名的外部脚本（本仓库内已全部改完）需要按 `*-actions*.md` 通配读取。
+- **验证**：`actions_paths.parse_name()` / `write_path()` 单元自测通过（旧名 → legacy、新名 → 带 stag、无 sid → 旧名）；`log_action.sh` 端到端实测：带 `PI_SESSION_ID` 写入 `…-actions-<stag>.md`、不带则写 `…-actions.md`；`monitor_guard._own_actions_files()` 在本仓库实测正确回退到旧单文件；`account_status._today_action_files()` 正常返回。
+
 ### 变更（连败闸改「按市场分开 + 每日重新计数」，2026-11-18 用户立，T202HKUS）
 
 - **为什么改**：旧口径是「连败跨日累计、港美共用一条账户级序列」。用户 2026-11-18 指出两点不对：① 连败闸是**日内闸**，第二日应当重新计数——旧口径下「昨天 3 连败」在今天第一笔亏损时会立刻变成 4 连败并锁死当天，与「当日停止开新仓」的语义不符；② 港股与美股**完全解耦**（交易时段不重叠、标的与行情各自独立），不该共用一条序列，也就不需要「把亏损时刻换算到另一个市场时区」那套跨市场逻辑。

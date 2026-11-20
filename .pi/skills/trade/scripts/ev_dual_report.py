@@ -65,7 +65,10 @@ def actions_times(market="us"):
     """
     suffix = "ET" if market == "us" else "HKT"
     out = {}
-    for p in sorted(glob.glob(str(ROOT / "actions" / f"*-{suffix}-actions.md"))):
+    # 2026-11-20 起 actions 按会话分文件：旧单文件与 *-actions-<stag>.md 都要扫
+    _paths = sorted(set(glob.glob(str(ROOT / "actions" / f"*-{suffix}-actions.md"))
+                        + glob.glob(str(ROOT / "actions" / f"*-{suffix}-actions-*.md"))))
+    for p in _paths:
         try:
             txt = open(p, encoding="utf-8").read()
         except Exception:

@@ -43,7 +43,10 @@ def parse_actions(market, since=None, until=None):
     """解析开仓记录 → [{dt, date, symbol, entry, initial_r, fixed_r}]，按时间升序。"""
     out = []
     pattern = os.path.join(PROJECT_ROOT, "actions", f"*{MARKET_SUFFIX[market]}")
-    for path in sorted(glob.glob(pattern)):
+    # 2026-11-20 起 actions 按会话分文件：旧单文件 + *-actions-<stag>.md 都纳入
+    _paths = sorted(set(glob.glob(pattern)
+                        + glob.glob(pattern.replace("-actions.md", "-actions-*.md"))))
+    for path in _paths:
         date = os.path.basename(path)[:10]
         if since and date < since:
             continue

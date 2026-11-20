@@ -63,6 +63,31 @@ STATE_DIR = os.path.join(_PROJECT_ROOT, "state")
 # 项目根，这里把脚本目录加进搜索路径，保证 import 到的是同一份 session_tag.py。
 sys.path.append(os.path.join(_PROJECT_ROOT, ".pi", "skills", "trade", "scripts"))
 from session_tag import session_tag, session_matches, is_legacy
+import actions_paths as AP  # actions 文件命名规则（2026-11-20 起按会话分文件）
+
+
+def _own_actions_files(root, market, date_str, stag):
+    """本会话该日该市场的 actions 文件（分文件优先，缺失时回退旧单文件）。
+
+    收尾检查只看本会话自己的记录：否则并行会话的成交会把本会话报成「有成交未收尾」。
+    """
+    try:
+        return AP.own_or_legacy(market, date_str, root, stag)
+    except Exception:
+        suffix = "HKT" if market == "hk" else "ET"
+        legacy = os.path.join(root, "actions", f"{date_str}-{suffix}-actions.md")
+        return [legacy] if os.path.exists(legacy) else []
+
+
+def _read_actions(files):
+    """把一组 actions 文件拼成一段文本（只读，失败的文件跳过）。"""
+    buf = []
+    for fp in files:
+        try:
+            buf.append(open(fp, encoding="utf-8").read())
+        except Exception:
+            continue
+    return "\n".join(buf)
 
 
 def _actions_has_session(txt, stag):
@@ -289,13 +314,11 @@ def _stop_done_reminder(payload=None):
     # 取 ET 今天与昨天（美股交易日跨北京午夜，两个都要看）
     for back in (0, 1):
         d = (now_et - timedelta(days=back)).strftime("%Y-%m-%d")
-        acts = os.path.join(root, "actions", f"{d}-ET-actions.md")
-        if not os.path.exists(acts):
+        _acts_list = _own_actions_files(root, "us", d, stag)
+        if not _acts_list:
             continue
-        try:
-            txt = open(acts, encoding="utf-8").read()
-        except Exception:
-            continue
+        acts = _acts_list[-1]  # mtime 门槛取最新一个文件
+        txt = _read_actions(_acts_list)
         if "🟢🟢🟢 开仓" not in txt:
             continue
         # 标记匹配（2026-10-20 二改）：本会话在该日有交易（文件里有本会话 🆔）→ 只认本
@@ -336,13 +359,11 @@ def _stop_done_reminder(payload=None):
     # 【北京日期】命名，标记为 stop_done_hk_<北京日期>_<stag>。
     for back in (0, 1):
         d = (datetime.now(BJ_TZ) - timedelta(days=back)).strftime("%Y-%m-%d")
-        acts = os.path.join(root, "actions", f"{d}-HKT-actions.md")
-        if not os.path.exists(acts):
+        _acts_list = _own_actions_files(root, "hk", d, stag)
+        if not _acts_list:
             continue
-        try:
-            txt = open(acts, encoding="utf-8").read()
-        except Exception:
-            continue
+        acts = _acts_list[-1]  # mtime 门槛取最新一个文件
+        txt = _read_actions(_acts_list)
         if "🟢🟢🟢 开仓" not in txt:
             continue
         is_owner = _actions_has_session(txt, stag)
