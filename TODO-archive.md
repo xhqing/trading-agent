@@ -2,6 +2,8 @@
 
 - [x] **T206US** **worktree 盯盘会话的断链兜底从未生效**：`monitor_guard.py` 的 `_is_monitoring_session()` 三处路径（前提 log、停盯标记、monitor_market）只扫主仓库 `tmp/`，而 worktree 盯盘把采样日志写在 `worktree/tmp/` → 第一道前提恒 False → stop 分支整段跳过 → 「段结束没重启」强提醒对 worktree 会话从未执行。2026-11-20 实录：漏启下一段后静默 45 小时。✅**已完成**（完成：2026-11-22 13:35）三处改为遍历 `_log_dirs()`（跨 worktree），回归验证：同一场景修复后 True / 修复前 False。CHANGELOG 已记。
 
+- [ ] **T205US** **合盖防睡眠未生效（盯盘中断的真实主因）**：11-20 美股盯盘在 ET 12:51 后两会话双双静默 45 小时，机器在 11-20 夜间进入睡眠（`caffeinate -s` 只能防空闲/维护睡眠，**防不住合盖**；系统日志多条铁证：`Clamshell Sleep ... Using AC (Charge:100%)`，接电源满电照样睡）。当前 `pmset -g` 无 `disablesleep` 项。**动作**：① 盯盘前执行 `sudo pmset -a disablesleep 1`（需用户授权一次，可逆，停盯后 `disablesleep 0` 恢复）；② 若不便改系统设置，则 preflight 检测到未开启时明确警告「合盖必睡，请开盖盯盘」；③ keep-awake skill 文档修正「接电源即可防合盖」的错误结论。（记录：2026-11-22 13:20） ✅**已更新**（2026-11-22 15:05）：**本条定性错误，已证伪**——`caffeinate -s` 实际有效：11-20 22:52:16 的 assertions 快照显示它持 `PreventSystemSleep` 断言（已持续 8h21m），7 秒后系统进入的是 `Entering DarkWake state` 而非完全睡眠，即合盖被降级为 DarkWake、机器未睡死（本会话合盖后仍正常运行 2 小时）。我当时引用的 `Entering Sleep ... Clamshell Sleep ... Using AC` 几条记录经核对均发生在**非盯盘时段**（caffeinate 已解除），不构成「盯盘防不住合盖」的证据。**真实原因**见 T206US（worktree 路径漏改导致断链兜底从未生效），已修复。**Retained 结论**：合盖在接 AC + caffeinate 下只会进 DarkWake（后台任务可能被节流但不完全停止），不需要 `pmset disablesleep`；合盖防护无需改动。
+
 ## 2026-11-17 T200/T201 归档（采样段仓位对账置顶 + 移损移盈二次读闸，代码已修）
 
 > 闭环路径：2026-11-17 用户「把橙色待办全部处理掉」→ 同一 worktree（`trading-agent-position-state-check` / `fix/position-state-check`）一次做完两条 + 排查 IP 池误报 → CHANGELOG 0.11.2。
