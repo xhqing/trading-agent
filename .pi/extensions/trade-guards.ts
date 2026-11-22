@@ -16,12 +16,18 @@
  *    提醒文本追加进工具结果内容（模型下一轮就能看到，不额外触发回合）。
  * 4. `agent_settled`（回合静止、不再自动继续时）→ `monitor_guard.py stop`：盘中盯盘
  *    会话若密采样断链，把提醒作为自定义消息注入并唤醒一轮。
+ * 5. **唤醒信箱**（2026-11-22 立，T202HKUS）：会话外的看护 `hooks/sampling_watchdog.py`
+ *    发现「盘中断链且会话没有回合」时，往本会话自己的 `tmp/wake_requests/<stag>.json`
+ *    写一条请求；本扩展每 15 秒看一眼，有请求就删掉并注入消息唤醒一轮。
+ *    为什么用文件而不是外部工具：项目的核心功能不依赖项目外的东西（用户 2026-11-22 立）。
  *
  * 规则本身一行都不在本文件里——改规则只改 `hooks/*.py`，立即生效。pi 没有内建 hooks
  * 机制，扩展是 pi 的官方扩展点，桥接脚本是最小重复的方案（规则单一源）。
  */
+import fs from "node:fs";
+import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { additionalContext, runHook } from "./lib/hooks.ts";
+import { PROJECT_ROOT, additionalContext, runHook } from "./lib/hooks.ts";
 
 // —— 廉价预筛（严格超集，命中才 spawn Python，省掉绝大多数命令的进程开销）——
 // secret_guard 只在命令文本出现凭证路径特征时可能拦。
@@ -76,10 +82,11 @@ export default function tradeGuards(pi: ExtensionAPI) {
 			const command = commandOf(event as PiToolCallLike);
 			if (!command) return;
 
-			const sessionId = ctx.sessionManager.getSessionId();
+			const ctxSessionId = ctx.sessionManager.getSessionId();
+			if (!sessionId) sessionId = ctxSessionId;
 			const payload = {
 				hook_event_name: "PreToolUse",
-				session_id: sessionId,
+				session_id: ctxSessionId,
 				tool_name: "Bash", // pi 的 bash / background_run 对守卫统一按 Bash 语义处理
 				tool_input: { command },
 			};
@@ -186,4 +193,63 @@ export default function tradeGuards(pi: ExtensionAPI) {
 			// 忽略
 		}
 	});
+
+	// —— ⑤ 外部看护的唤醒信箱（2026-11-22 立，T202HKUS） ——
+	// 场景：会话在 ET 11:03 断链后再没有任何回合，`agent_settled` 那条兜底没有触发点，
+	// 于是由会话外的看护（hooks/sampling_watchdog.py，launchd 每 60 秒）往**本会话自己的**
+	// tmp/wake_requests/<stag>.json 写一条请求；这里每 15 秒看一眼，读到就删掉并注入消息
+	// 唤醒一轮（AI 于是能重启采样段、补缺的分析）。
+	//
+	// 为什么用项目自己的文件信箱而不是任何外部 CLI：项目的核心功能不该依赖项目外的工具
+	// （用户 2026-11-22 立）。信箱落在各会话自己的 tmp/ 下，天然按会话隔离，不存在
+	// 「投错会话」的问题；tmp/ 被清掉也只是丢一条请求，不影响任何状态。
+	const WAKE_DIR = path.join(PROJECT_ROOT, "tmp", "wake_requests");
+	let sessionId = (process.env.PI_SESSION_ID ?? "").trim();
+
+	/** 读取并消费本会话的唤醒请求；返回要给 AI 的提醒文本（无请求返回 null）。 */
+	const consumeWakeRequest = (): string | null => {
+		const stag = sessionId.replace(/-/g, "");
+		if (!stag) return null;
+		const file = path.join(WAKE_DIR, `${stag}.json`);
+		try {
+			if (!fs.existsSync(file)) return null;
+			const raw = fs.readFileSync(file, "utf8");
+			fs.unlinkSync(file); // 先删再注入：同一请求不让它触发第二轮
+			const data = JSON.parse(raw) as { market?: string; gap_sec?: number; at?: string };
+			const label = data.market === "HK" ? "港股" : "美股";
+			const mins = Math.max(1, Math.round(Number(data.gap_sec ?? 0) / 60));
+			return (
+				`⚠️ 外部看护（sampling_watchdog）｜${label}盘中密采样已停约 ${mins} 分钟` +
+				`（检测时间 ${data.at ?? "刚才"}）。\n` +
+				`会话当时已经没有任何回合、agent_settled 兜底发不出来，所以由看护直接唤醒。\n` +
+				`请立刻 background_run 起下一段密采样（标的与关键位按本场最后一份 actions 记录 / ` +
+				`最后一份 monitor_log 的文件名恢复），并补上这段时间缺的分析；` +
+				`若确已到停盯边界，走停盯收尾（stop_summary → keepawake_off → monitor_unregister）。\n` +
+				`（若看护已自行代跑过几段，痕迹在 tmp/sampling_watchdog_takeover_${data.market ?? "US"}.log。）`
+			);
+		} catch {
+			return null; // 请求文件写坏 / 刚被另一端改掉：本轮忽略，下次再看
+		}
+	};
+
+	// 轮询间隔：默认 15 秒；`TRADE_GUARDS_WAKE_POLL_MS` 可调（自检脚本用它把间隔缩到几十毫秒，
+	// 排障时也可以临时调快）。下限 20ms，避免误设成 0 把自己打成忙等。
+	const WAKE_POLL_MS = (() => {
+		const raw = Number(process.env.TRADE_GUARDS_WAKE_POLL_MS ?? "");
+		return Number.isFinite(raw) && raw >= 20 ? raw : 15000;
+	})();
+	const wakeTimer = setInterval(() => {
+		const note = consumeWakeRequest();
+		if (!note) return;
+		try {
+			pi.sendMessage(
+				{ customType: "sampling-wake", content: note, display: true },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		} catch {
+			// 注入失败不阻塞会话（下一轮看护会按冷却再投一次）
+		}
+	}, WAKE_POLL_MS);
+	// 不因这个定时器拖住进程退出（宿主关闭时立即放行）
+	(wakeTimer as unknown as { unref?: () => void }).unref?.();
 }
