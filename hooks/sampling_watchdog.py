@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""盯盘中断外部看护（2026-11-22 立，T202HKUS；同日按用户要求改为全自动，不外发通知）。
+"""盯盘中断外部看护（2026-11-22 立，T202HKUS；全自动、只用项目自己的机制）。
 
 为什么需要它（2026-11-20 实录）：美股会话在 ET 11:03 采样链断掉之后，**再没有发生任何回合**
 （没有后台任务完成通知、AI 不会自己醒来）。而 `monitor_guard.py` 的断链兜底挂在
 `agent_settled`（回合静止）上——没有回合就没有触发点，那个兜底再准也发不出提醒。
 结果是整个后半场无人盯盘、约 5 小时后才被用户发现，停盯收尾迟到约 24 小时。
 
-**定位：全自动、不依赖人工介入（2026-11-22 用户立）**。所以它既不发飞书、也不弹窗喊人，
-只做两件自动动作：
+**两条硬约束（2026-11-22 用户立）**：
+  ① 全自动、不依赖人工介入——不发飞书、不弹窗喊人；
+  ② **不用项目外的工具**——所以唤醒通道不放给任何外部 CLI，而是**项目自己的文件信箱 +
+     项目自己的 pi 扩展**（见下）。
 
-  ① **优先叫醒会话**：盘中本场断链时，用 `pi-intercom` 给盯这个市场的会话发一条消息
-     （消息进来就会触发一个回合，AI 于是能重启采样段并继续分析）；
-  ② **叫不醒就自己接上**：没有可唤醒的会话（会话已死 / 不在线 / intercom 不可用）时，
-     看护自己按「本场最后在盯的标的与模式」用 tmux 起下一段密采样——数据链不再断，
-     直到 AI 回来接管（AI 一回到场，它自己的段就在跑，看护随即静默）。
-     接管痕迹写在 `tmp/sampling_watchdog_takeover_<市场>.log`，AI 回来后读一眼就知道
+做两件事，都是项目内部机制：
+
+  ① **投递唤醒请求（文件信箱）**：盘中本场断链时，看护往会话自己的 `tmp/wake_requests/`
+     写一个 `<stag>.json`；会话内的扩展 `.pi/extensions/trade-guards.ts` 每 15 秒看一眼
+     自己的信箱，有请求就删掉并 `sendMessage(triggerTurn)` 唤醒一轮——AI 于是能重启采样段
+     并补上缺的分析。全程只用「项目里的文件 + pi 扩展 API + tmux（项目既定的后台进程载体）」，
+     不依赖任何第三方包或服务。
+  ② **叫不醒就自己接上**：没有候选会话、或请求投递 5 分钟仍没被认领（会话已死 / 没在跑），
+     看护按「本场最后在盯的标的与模式」用 tmux 起一段密采样——数据链不再断。
+     接管痕迹写 `tmp/sampling_watchdog_takeover_<市场>.log`，AI 回来后读一眼就知道
      「这段时间是看护代跑的，分析要补」。
 
 判定只看三件事实（每次 60 秒巡检）：
@@ -26,7 +32,8 @@
   ③ **真断了**：段进程不在（`sampling_process_alive`）+ 本市场最后一份日志已超过
      `GAP_ALERT_SECONDS`（300 秒；正常段间空窗只有几秒）。
 
-节流：叫醒同一市场 10 分钟内最多一次（避免刷屏会话）；自己接管两段之间至少隔
+节流：同一市场 10 分钟内最多投一次唤醒请求；投递后给会话 `WAKE_RECLAIM_SECONDS`（300 秒）
+认领时间，期间不接管（避免「会话正在重启段」和「看护起段」撞车）；两次接管之间至少隔
 `MIN_RESTART_INTERVAL_SECONDS`（120 秒），防止某段启动即失败时每分钟重试。
 已正常停盯（`state/stop_done_<市场>_<交易日>*.txt` 晚于最后一份日志）一律静默。
 任何异常都静默退出——看护自己不能变成新的故障源。
@@ -39,7 +46,7 @@
 用法：
     python3 hooks/sampling_watchdog.py               # 定时巡检（launchd 调用）
     python3 hooks/sampling_watchdog.py --status      # 打印当前判定与节流状态（不做任何动作）
-    python3 hooks/sampling_watchdog.py --dry-run     # 只判定、只打印将要执行的命令，不发送、不起进程
+    python3 hooks/sampling_watchdog.py --dry-run     # 只判定、只打印将要执行的动作，不写信箱、不起进程
     python3 hooks/sampling_watchdog.py --force       # 忽略窗口 / 节流，立即按当前事实判定并执行
     python3 hooks/sampling_watchdog.py --now "2026-11-23 23:00:00" --status   # 指定本机时间（测试）
 """
@@ -60,14 +67,15 @@ PROJECT_ROOT = mg._PROJECT_ROOT
 STATE_DIR = mg.STATE_DIR
 SCRIPTS_DIR = os.path.join(PROJECT_ROOT, ".pi", "skills", "trade", "scripts")
 SEGMENT_SCRIPT = os.path.join(SCRIPTS_DIR, "monitor_segment.py")
-INTERCOM = os.path.expanduser("~/.pi/agent/npm/node_modules/.bin/pi-intercom")
 
-GAP_ALERT_SECONDS = 300           # 本市场最后一份 log 超过这个时长 = 断了（正常段间空窗 <90 秒）
-COOLDOWN_SECONDS = 600            # 同一市场的两次「叫醒会话」最小间隔
+GAP_ALERT_SECONDS = 300            # 本市场最后一份 log 超过这个时长 = 断了（正常段间空窗 <90 秒）
+WAKE_COOLDOWN_SECONDS = 600        # 同一市场两次「投递唤醒请求」的最小间隔
+WAKE_RECLAIM_SECONDS = 300         # 投递后给会话的认领时间，期间看护不接管（防撞车）
 MIN_RESTART_INTERVAL_SECONDS = 120  # 两次「自己接管起段」的最小间隔
-MAX_TARGETS = 4                   # 自己接管时最多盯几只（按最后一份日志的标的顺序取）
-SEGMENT_SECONDS = 40              # 与 trade skill 的 40 秒密采样一致（脚本内部也夹到 40）
+MAX_TARGETS = 4                    # 自己接管时最多盯几只（按最后一份日志的标的顺序取）
+SEGMENT_SECONDS = 40               # 与 trade skill 的 40 秒密采样一致（脚本内部也夹到 40）
 SEGMENT_INTERVAL = 10
+WAKE_DIRNAME = "wake_requests"     # 会话自己 tmp 下的信箱目录（扩展每 15 秒看一次）
 STATE_PATH = os.path.join(STATE_DIR, "sampling_watchdog.json")
 BEAT_PATH = os.path.join(STATE_DIR, "sampling_watchdog_beat.json")
 
@@ -186,10 +194,14 @@ def stop_done_after_last_log(market, now):
     return newest_marker >= now.timestamp() - age
 
 
-# —— 动作一：叫醒会话 ——
+# —— 动作一：往会话信箱投递唤醒请求（项目内机制，不碰外部工具） ——
 
-def owner_sessions(market, now):
-    """盯这个市场的会话（按 `tmp/monitor_market_*.json` 的 updated 从新到旧）。"""
+def market_sessions(market, now):
+    """盯这个市场的会话：[(updated, sid, stag, log_dir)]，按 updated 新→旧。
+
+    数据来源是采样脚本段启动时写的 `tmp/monitor_market_*.json`（会话自己的 tmp），
+    `log_dir` 就是那个 tmp 目录——唤醒请求要写回**会话自己**的 tmp，扩展才看得到。
+    """
     out = []
     recent_cut = now.timestamp() - 12 * 3600
     for d in mg._log_dirs():
@@ -214,89 +226,52 @@ def owner_sessions(market, now):
                 sid = f"{stag[:8]}-{stag[8:12]}-{stag[12:16]}-{stag[16:20]}-{stag[20:]}"
             else:
                 sid = stag
-            out.append((updated, sid, stag))
+            out.append((updated, sid, stag, d))
     out.sort(reverse=True)
     return out
 
 
-def live_sessions():
-    """在线会话 {session_id: {name, cwd}}（pi-intercom list --json）。
-
-    为什么必须查：pi-intercom 的 `--to <id>` 在目标不在线时会**退回到「唯一的在线会话」**
-    （2026-11-22 实测：传一个不存在的 id，消息被投递给另一个会话）。看护的消息内容是
-    「盘中断链、立刻起采样段」，投错会话等于对无关的 agent 谎报军情。所以只对**确认在线、
-    且 cwd 在本项目（主工作区或本项目 worktree）**的会话发送。
-    """
-    if not os.path.isfile(INTERCOM):
-        return {}
-    try:
-        res = subprocess.run([INTERCOM, "list", "--json"], capture_output=True,
-                             text=True, timeout=20)
-        data = json.loads(res.stdout or "{}")
-        out = {}
-        for sess in (data.get("sessions") or []):
-            sid = str(sess.get("id") or "")
-            if sid:
-                out[sid] = {"name": sess.get("name"), "cwd": str(sess.get("cwd") or "")}
-        return out
-    except Exception:
-        return {}
+def wake_request_path(entry):
+    _updated, _sid, stag, log_dir = entry
+    return os.path.join(log_dir, WAKE_DIRNAME, f"{stag}.json")
 
 
-def _is_project_session(cwd):
-    """会话 cwd 是否属于本项目：主工作区 `trading-agent` 或它的 worktree `trading-agent-*`。"""
-    if not cwd:
-        return False
-    root = PROJECT_ROOT.rstrip(os.sep)
-    return cwd == root or cwd.startswith(root + os.sep) or cwd.startswith(root + "-")
-
-
-def intercom_text(market, gap_sec, now):
-    label = "美股" if market == "US" else "港股"
-    gap_min = max(1, int(gap_sec // 60))
-    return (
-        f"⚠️ 外部看护（sampling_watchdog）｜{label}盘中密采样已停 {gap_min} 分钟："
-        f"本场最后一份 monitor_log 是 {gap_min} 分钟前，且段进程不在。\n"
-        f"这是「上一段跑完没起下一段」的形态，而会话已没有回合、`agent_settled` 兜底发不出来，"
-        f"所以才由外部直接叫你。\n"
-        f"请立刻 background_run 起下一段密采样（标的与关键位按本场最后一份 actions 记录 / "
-        f"最后一份 monitor_log 的文件名恢复），并补上这段时间缺的分析；"
-        f"若确已到停盯边界，走停盯收尾（stop_summary → keepawake_off → monitor_unregister）。\n"
-        f"（若看护已自行代跑过几段，痕迹在 tmp/sampling_watchdog_takeover_{market}.log。）"
-    )
-
-
-def wake_sessions(market, gap_sec, now, dry_run=False):
-    """叫醒盯这个市场的会话；返回 [(sid, ok, detail)]。"""
-    results = []
-    candidates = owner_sessions(market, now)[:2]
-    if not candidates:
-        return []
+def write_wake_request(entry, market, gap_sec, now, dry_run=False):
+    """往会话信箱写一条唤醒请求（原子写；扩展读后删除）。返回 (是否写入, 路径)。"""
+    path = wake_request_path(entry)
     if dry_run:
-        return [(sid, True, "dry-run 未发送") for _u, sid, _s in candidates]
-    if not os.path.isfile(INTERCOM):
-        return [(sid, False, "pi-intercom 不存在") for _u, sid, _s in candidates]
-    live = live_sessions()
-    if not live:
-        return [(sid, False, "intercom 无在线会话") for _u, sid, _s in candidates]
-    for _updated, sid, _stag in candidates:
-        info = live.get(sid)
-        if not info:
-            results.append((sid, False, "该会话不在线——跳过，避免误唤醒别的会话"))
-            continue
-        if not _is_project_session(info.get("cwd") or ""):
-            results.append((sid, False, f"会话 cwd 不在本项目（{info.get('cwd')}）——跳过"))
-            continue
+        return True, path
+    payload = {
+        "market": market,
+        "gap_sec": int(gap_sec or 0),
+        "at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "from": "sampling_watchdog",
+        "session": entry[1],
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+        return True, path
+    except OSError as exc:
+        return False, f"{path}（{exc}）"
+
+
+def pending_wake_requests(market, now):
+    """尚未被会话认领的请求：[(path, age_sec)]（按年龄从大到小）。"""
+    out = []
+    for entry in market_sessions(market, now):
+        path = wake_request_path(entry)
         try:
-            res = subprocess.run(
-                [INTERCOM, "send", "--to", sid, "--text", intercom_text(market, gap_sec, now)],
-                capture_output=True, text=True, timeout=30,
-            )
-            results.append((sid, res.returncode == 0,
-                            ((res.stdout or "") + (res.stderr or "")).strip()[:160]))
-        except Exception as exc:
-            results.append((sid, False, f"调用失败：{exc}"))
-    return results
+            age = now.timestamp() - os.path.getmtime(path)
+        except OSError:
+            continue
+        out.append((path, age))
+    out.sort(key=lambda x: -x[1])
+    return out
 
 
 # —— 动作二：自己接管（叫不醒时把链接回去） ——
@@ -378,14 +353,14 @@ def takeover(market, now, dry_run=False):
 # —— 节流 ——
 
 def allow_wake(market, now, state):
-    """叫醒节流：同市场 COOLDOWN_SECONDS 内最多一次。返回 (可发, 原因)。"""
+    """投递节流：同市场 WAKE_COOLDOWN_SECONDS 内最多投一次。返回 (可投, 原因)。"""
     day = market_date_of(market, now)
     cell = (state.get("wakes") or {}).get(market) or {}
     if cell.get("date") != day:
         return True, "本交易日首次"
     last = float(cell.get("last_ts") or 0)
-    if now.timestamp() - last < COOLDOWN_SECONDS:
-        return False, f"距上次叫醒不足 {COOLDOWN_SECONDS // 60} 分钟"
+    if now.timestamp() - last < WAKE_COOLDOWN_SECONDS:
+        return False, f"距上次投递不足 {WAKE_COOLDOWN_SECONDS // 60} 分钟"
     return True, "冷却已过"
 
 
@@ -400,6 +375,13 @@ def record_wake(market, now, state):
     cell["last_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
     wakes[market] = cell
     save_state(state)
+
+
+def wake_recent(market, now, state):
+    """是否在认领窗口内（刚投递过唤醒请求，等会话自己起来）。"""
+    cell = (state.get("wakes") or {}).get(market) or {}
+    last = float(cell.get("last_ts") or 0)
+    return bool(last) and (now.timestamp() - last) < WAKE_RECLAIM_SECONDS
 
 
 def allow_takeover(market, now, state):
@@ -437,16 +419,18 @@ def describe(market, now):
         return f"{market}：最后一份日志 {int(age)} 秒前（< {GAP_ALERT_SECONDS} 秒宽限）→ 正常"
     if stop_done_after_last_log(market, now):
         return f"{market}：已正常停盯（停盯标记晚于最后一份日志）→ 静默"
-    argv, tmux_session, _log = takeover_command(market, now)
+    sessions = market_sessions(market, now)
+    argv, _tmux, _log = takeover_command(market, now)
     plan = ("可接管：<" + " ".join(argv) + ">" if argv else "没有可接管标的")
     return (f"{market}：段进程不在、最后一份日志 "
-            f"{'无' if age is None else str(int(age)) + ' 秒前'} → 应恢复｜{plan}")
+            f"{'无' if age is None else str(int(age)) + ' 秒前'} → 应恢复"
+            f"｜可投递信箱的会话 {len(sessions)} 个｜{plan}")
 
 
 def main():
-    ap = argparse.ArgumentParser(description="盯盘中断外部看护（独立于 AI 会话，全自动）")
+    ap = argparse.ArgumentParser(description="盯盘中断外部看护（独立于会话、全自动、无外部依赖）")
     ap.add_argument("--status", action="store_true", help="只打印判定与节流状态，不做任何动作")
-    ap.add_argument("--dry-run", action="store_true", help="只判定并打印将要执行的命令，不发送、不起进程")
+    ap.add_argument("--dry-run", action="store_true", help="只判定并打印将要执行的动作，不写信箱、不起进程")
     ap.add_argument("--force", action="store_true", help="忽略窗口与节流，按当前事实立即判定并执行")
     ap.add_argument("--now", help="指定本机时间 'YYYY-MM-DD HH:MM:SS'（测试用）")
     args = ap.parse_args()
@@ -466,8 +450,10 @@ def main():
         for mk in ("HK", "US"):
             print("  " + describe(mk, now))
         state = load_state()
-        print(f"  叫醒记录：{json.dumps(state.get('wakes') or {}, ensure_ascii=False)}")
+        print(f"  投递记录：{json.dumps(state.get('wakes') or {}, ensure_ascii=False)}")
         print(f"  接管记录：{json.dumps(state.get('takeovers') or {}, ensure_ascii=False)}")
+        pend = pending_wake_requests(market, now) if market else []
+        print(f"  未认领的唤醒请求：{[p for p, _a in pend]}")
         return 0
 
     if market is None and not args.force:
@@ -486,36 +472,45 @@ def main():
         return 0
 
     state = load_state()
-    woke = []
-    if args.force:
-        woke = wake_sessions(market, age or 0, now, dry_run=args.dry_run)
-    else:
-        ok_wake, why = allow_wake(market, now, state)
-        if ok_wake:
-            woke = wake_sessions(market, age or 0, now, dry_run=args.dry_run)
-        else:
-            why = f"叫醒节流：{why}"
-        if not args.dry_run and woke:
-            record_wake(market, now, state)
+    sessions = market_sessions(market, now)[:2]
 
-    # 叫不醒（没有候选 / 全都失败）→ 自己把链接回去
-    woke_ok = any(r[1] for r in woke)
-    took, take_detail = (False, "已有会话被叫醒，交给它重启")
-    if not woke_ok:
+    # ① 有会话在盯过这个市场 → 往它的信箱投唤醒请求（给 300 秒认领时间，期间不接管）
+    delivered = []
+    if sessions:
         if args.force:
-            took, take_detail = takeover(market, now, dry_run=args.dry_run)
+            ok_wake = True
         else:
-            ok_take, why_take = allow_takeover(market, now, state)
-            if ok_take:
-                took, take_detail = takeover(market, now, dry_run=args.dry_run)
-                if not args.dry_run:
-                    record_takeover(market, now, state, took)
-            else:
-                take_detail = f"接管节流：{why_take}"
+            ok_wake, _why = allow_wake(market, now, state)
+        if ok_wake:
+            for entry in sessions:
+                ok, path = write_wake_request(entry, market, age or 0, now, dry_run=args.dry_run)
+                delivered.append((entry[1], ok, path))
+            if not args.dry_run and any(d[1] for d in delivered):
+                record_wake(market, now, state)
+        elif wake_recent(market, now, state):
+            pass
+
+    if sessions and wake_recent(market, now, state):
+        print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
+              f"断 {int(age or 0)} 秒｜投递唤醒请求：{delivered or '（冷却中，本轮不重复投递）'}"
+              f"｜接管 — 等会话认领（{WAKE_RECLAIM_SECONDS} 秒窗口）")
+        return 0
+
+    # ② 没有会话、或投递后仍没人认领 → 自己接管
+    if args.force:
+        took, take_detail = takeover(market, now, dry_run=args.dry_run)
+    else:
+        ok_take, why_take = allow_takeover(market, now, state)
+        if ok_take:
+            took, take_detail = takeover(market, now, dry_run=args.dry_run)
+            if not args.dry_run:
+                record_takeover(market, now, state, took)
+        else:
+            took, take_detail = False, f"接管节流：{why_take}"
 
     print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
-          f"断 {int(age or 0)} 秒｜叫醒 {woke if woke else '（无可唤醒会话）'}｜"
-          f"接管 {'✅' if took else '—'} {take_detail[:160]}")
+          f"断 {int(age or 0)} 秒｜投递唤醒请求：{delivered or '（无会话可投）'}"
+          f"｜接管 {'✅' if took else '—'} {take_detail[:160]}")
     return 0
 
 
