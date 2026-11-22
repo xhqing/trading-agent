@@ -170,4 +170,3 @@ date,symbol,direction,entry_price,exit_price,shares,max_loss,type,mode,shadow
 2026-11-20,US.TQQQ,long,45.6200,45.3695,485,155.20,etf,auto_paper,
 2026-11-20,US.MU,short,621.3950,612.3700,23,50.72,stock,auto_paper,
 2026-11-20,US.TQQQ,short,44.2100,44.0900,504,221.76,etf,auto_paper,
-2026-11-20,US.TQQQ,short,43.8800,43.8800,515,396.55,etf,auto_paper,
