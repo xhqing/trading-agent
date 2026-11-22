@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 持仓定时飞书提醒 launchd 配置（2026-11-22 立，首个用例 = T203US）。
+
+     用途：把「某个持仓必须在某个时刻之前处置」这类提醒交给定时任务发飞书，
+     不依赖盯盘会话、不依赖 AI 记得。
+
+     为什么每 60 秒巡检、而不是 StartCalendarInterval 定点排程：
+     后者的时间按**系统本地时区**排程，美东时刻换算成北京时间会随冬夏令时变化，
+     写死任何一个都会错位。故由 plist 每 60 秒唤起 position_reminder.py，脚本用
+     zoneinfo 取真实美东时间，只在事件窗口内发送；没有窗口内事件时立即退出。
+
+     部署位置：macmini（常开算力机）。本机 MacBook 合盖且没接电源会休眠，
+     休眠期间 launchd 不触发，而「该处置的持仓没处置」正是最需要提醒的场景。
+
+     部署（自动适配本机路径，幂等）：
+       bash hooks/install_position_reminder.sh
+     卸载（只在用户明确要求时）：
+       bash hooks/install_position_reminder.sh --unload
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daytrading.position-reminder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/Users/mac/Developer/trading-agent/.pi/skills/trade/scripts/position_reminder.py</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/daytrading-position-reminder.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/daytrading-position-reminder.err</string>
+</dict>
+</plist>

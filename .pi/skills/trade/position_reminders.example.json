@@ -1,0 +1,11 @@
+{
+  "_comment": "持仓定时飞书提醒的计划表样板（复制为 state/position_reminders.json 后按需填写；state/ 已被 .gitignore 忽略，不入库）。每条事件在 at_et 指定的美东时刻自动发一条飞书消息，发送由 macmini 上每 60 秒巡检一次的定时任务负责，与盯盘会话无关。字段：id = 事件标识（决定标记文件名，必填、不可重复）；at_et = 美东本地时刻 'YYYY-MM-DD HH:MM'（必填）；window_min = 补发窗口分钟数（默认 15，错过窗口即不再补发）；text = 消息正文（markdown，走飞书内容过滤、只发业务内容）；market = us / hk（默认 us，仅影响发送口径参数）。",
+  "events": [
+    {
+      "id": "sample-1",
+      "at_et": "2026-11-22 21:00",
+      "window_min": 15,
+      "text": "🔔 **持仓提醒（样例）**：把这条换成要提醒的具体持仓与截止时刻。"
+    }
+  ]
+}

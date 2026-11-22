@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+### 新增（持仓定时飞书提醒：按美东时刻给指定持仓发提醒，2026-11-22 用户立，T203US）
+
+- **为什么做**：2026-11-20 的补挂止损事故留下一笔 515 股 TQQQ 空头（成交 43.8499、无止损保护）过周末待处置，处置时点卡在「美股正式开盘（ET 09:30 = 北京 22:30）之前」，这段窗口跨了夜盘与盘前两个时段。靠人记、靠盯盘会话提醒都不可靠——那个时点没有会话在跑、AI 也不在场。用户要求：在开盘前的夜盘与盘前时段设飞书提醒，提醒在正式开盘前把仓位平掉。
+- **改了什么**：
+  1. 新增 `scripts/position_reminder.py`：按计划表（`state/position_reminders.json`，本机文件、不入库）在指定美东时刻发飞书。结构照抄已验证的 `power_reminder.py`——`zoneinfo` 取真实美东时间（不硬编码时差）、每 60 秒巡检、每发一条写标记 + `flock` 防并发、发送走 `notify_feishu.py --no-mark --no-session-id`（内容过滤、按部署机 lark-cli 绑定应用校正接收人、NO_PROXY 直连全部沿用；`feishu_config_override()` 直接复用 `power_reminder.py` 那一份实现，避免两套 open_id 口径漂移）。
+  2. 事件字段 `id` / `at_et`（美东墙钟 `YYYY-MM-DD HH:MM`）/ `window_min`（默认 15 分钟补发窗口）/ `text` / `market`；状态四态 sent / due / missed / pending，`--status` 按双时区（ET + 北京）逐条打印。**错过窗口不再补发**——过时的提醒会误导人，比不发更糟。
+  3. `hooks/com.daytrading.position-reminder.plist` + `hooks/install_position_reminder.sh`（照 `power-reminder` 的安装器写：自动把 Python 与项目根换成部署机的实际路径、可重复执行、幂等重装）。
+  4. `.pi/skills/trade/position_reminders.example.json` 样板；`references/monitoring.md` 补「持仓定时提醒」小节（含「不做持仓核对」这条边界）。
+- **部署**：macmini（常开机；本机合盖未接电源会休眠、休眠期间 launchd 不触发）。首份计划表 = T203US 三档：ET 11-22 21:00（北京 11-23 10:00）夜盘时段、ET 11-23 04:05（北京 17:05）盘前开始、ET 11-23 09:00（北京 22:00）开盘前 30 分钟。
+- **回归风险**：低。纯新增文件，不动任何既有流程与既有路径；与 `power_reminder` 的唯一耦合点是 import 它的 `feishu_config_override()`，导入失败时回退默认接收人、不阻断发送。
+- **验证**：`py_compile` / `bash -n` / `plutil -lint` 全过；离线三时点状态判定（准点前 pending / 窗口内 due / 窗口外 missed）、`--dry-run` 走通飞书内容过滤且不写标记、计划表缺失时退出码 2 且不打扰；macmini 实发一条自检消息确认链路通。
+
 ### 新增（复盘异常样本排除清单 + 修正滑点笔的 max_loss，2026-11-22 用户立，T207US）
 
 - **为什么做**：2026-11-20 有一笔成交**完全不是策略决策的产物**——止损腿补挂方向挂反，在空仓状态下凭空开出 515 股 TQQQ 裸空（T204US 事故）。它若进累积样本会污染 EV / 胜率 / R 分布，而两闸判据直接吃这份样本、决定实盘开仓许可。用户原话：「那一笔还没被平掉的空头交易是异常样本，不能进复盘数据」。
