@@ -1587,6 +1587,26 @@ def ensure_stop_protection_tiger(config, symbol, side, quantity, stop_price, _us
     """
     import time as _time
     steps = []
+    # ① 持仓校验（2026-11-22 修 T204）：止损腿可能**已成交平仓**（滑点使现价穿越
+    # 触发价时，开仓成交瞬间止损腿就被触发），此时活动止损单表本来就该是空的。
+    # 空仓状态下补挂任何 STP，一旦被触发就是凭空开仓——2026-11-20 实录：空仓补挂
+    # SELL STP 515 股，凭空开出裸空仓。所以先确认持仓，无持仓直接跳过、什么都不做。
+    try:
+        if _us:
+            from trade_utils_tiger_us import get_open_position_us as _getpos
+        else:
+            _getpos = get_open_position_tiger
+        _pos = _getpos(config, symbol)
+    except Exception as e:  # 查不到不敢赌，交给人工
+        return {"checked": True, "ok": False, "repaired": False, "stop_order_ids": [],
+                "steps": steps + [f"⚠️ 持仓查询异常：{e}"],
+                "warning": "持仓查询失败，无法判定是否仍需止损保护——请立即人工核实持仓与止损单"}
+    _held = abs(float((_pos or {}).get("quantity") or 0))
+    if _held == 0:
+        return {"checked": True, "ok": True, "repaired": False, "skipped": "no_position",
+                "stop_order_ids": [],
+                "steps": steps + ["账户已无该标的持仓（止损腿很可能已成交平仓）→ 不补挂止损"]}
+
     has, ids = has_active_stop_order_tiger(config, symbol, _us=_us)
     if has:
         return {"checked": True, "ok": True, "repaired": False,
@@ -1599,8 +1619,13 @@ def ensure_stop_protection_tiger(config, symbol, side, quantity, stop_price, _us
             from trade_utils_tiger_us import submit_stop_order_us as _submit
         else:
             _submit = submit_stop_order_tiger
-        oid = _submit(config, symbol, side, quantity, stop_price)
-        steps.append(f"补挂独立止损 STP order={oid} trigger={stop_price} qty={quantity}")
+        # ② 方向取反（2026-11-22 修 T204）：side 是**开仓方向**（'Buy' 开多 / 'Sell' 开空），
+        # 而 submit_stop_order_* 的契约是**止损动作方向**（做多止损 Sell / 做空止损 Buy）。
+        # 原实现把开仓方向原样传下去 → 做空持仓补出 SELL STP（加仓单）、做多持仓补出
+        # BUY STP，被触发即凭空开反向仓。这里显式取反。
+        stop_side = "Sell" if str(side).lower().startswith("b") else "Buy"
+        oid = _submit(config, symbol, stop_side, _held, stop_price)
+        steps.append(f"补挂独立止损 STP order={oid} side={stop_side} trigger={stop_price} qty={_held}")
     except Exception as e:
         steps.append(f"补挂止损失败：{e}")
         return {"checked": True, "ok": False, "repaired": False, "stop_order_ids": [],
