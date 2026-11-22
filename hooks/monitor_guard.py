@@ -49,7 +49,7 @@ import json
 import re
 import time
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 项目根 = hooks 的上一级（hooks -> 项目根）
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -202,10 +202,18 @@ def sampling_log_run_seconds():
     """当天采样已运行多久（秒）：读当天（按文件名日期）monitor_log 文件**首行采样时刻**，
     取最早的距今时长。无当天文件 / 读不出首行返回 None。与 monitor_watcher 的
     _sampling_log_age_seconds 同口径（读文件内容首行而非 ctime——ctime 会因 rename 等
-    元数据操作被重置，语义不稳，2026-08-17 实测教训）。"""
+    元数据操作被重置，语义不稳，2026-08-17 实测教训）。
+
+    2026-11-22 T202HKUS：目录改走 `_log_dirs()`（worktree 会话的 log 写在会话自己的 tmp）、
+    日期改认 `_active_log_dates()`（北京 + 美东），否则美股跨北京零点 / worktree 两场景下
+    本函数恒返回 None，空转硬门的「跑过一阵仍零心跳」分支永远不会触发。
+    """
     import glob
-    today = datetime.now().strftime("%Y%m%d")
-    logs = glob.glob(os.path.join(TMP_DIR, f"monitor_log_*_{today}_*.csv"))
+    logs = []
+    _dates = _active_log_dates()
+    for _d in _log_dirs():
+        for _dt in _dates:
+            logs.extend(glob.glob(os.path.join(_d, f"monitor_log_*_{_dt}_*.csv")))
     if not logs:
         return None
     from datetime import timedelta
@@ -477,24 +485,76 @@ def sampling_process_alive():
 
 
 def _log_dirs():
-    """采样日志可能所在的目录：主仓库 `tmp/` + 所有 `<repo>-watch-*/tmp/`。
+    """采样日志 / 会话痕迹可能所在的目录：主仓库 `tmp/` + 本项目**所有** worktree 的 `tmp/`。
 
-    为什么需要多目录（2026-11-07 实测）：盯盘跑在 worktree 里，采样脚本写的是
-    **worktree 的 tmp/**（worktree_start.py 刻意让 tmp/ 每场独立）；而 hook 是由主工作区
-    的 pi 扩展 spawn 的、PROJECT_ROOT = 主工作区，只看主仓库 tmp/ 会读到几天前的日志
-    ——断链判定虽然方向仍对（进程不在就是断了），但「刚结束的段」与「几天前的旧日志」
-    无法区分，SEGMENT_RESTART_GRACE 的 20 秒宽限就失效了（正常重启窗口内也会误唤醒）。
+    为什么需要跨 worktree（2026-11-07 首次立，2026-11-22 T202HKUS 重写）：盯盘跑在
+    worktree 里时，采样脚本写的是 worktree 自己的 `tmp/`（worktree_start.py 刻意让 tmp/
+    每场独立）；而 hook 由主工作区的 pi 扩展 spawn，PROJECT_ROOT 恒为主工作区。只看主仓库
+    tmp/ 会把「几分钟前刚结束的段」与「几天前的旧日志」混为一谈，断链宽限与断链提醒都会失效。
+
+    ⚠️ 2026-11-22 重写（T202HKUS）：旧实现按目录名 `<仓库名>-watch-*` glob——那是 2026-11-07
+    的临时命名，而项目 2026-11-09 起的 worktree 命名规范是 `<仓库名>-<事项>`
+    （如 `trading-agent-t203us-…`、`trading-agent-position-state-check`），于是**真实 worktree
+    的 tmp 一个都扫不到**：T206US 把三处路径改成走本函数，可本函数自己就漏了 → 2026-11-20
+    的断链兜底依旧全程静默。现在改用 `git worktree list --porcelain` 权威枚举
+    （与 preflight._ensure_watcher 取稳定根同一口径），git 不可用时退回旧 glob。
     """
     dirs = [TMP_DIR]
     try:
-        root = _PROJECT_ROOT.rstrip(os.sep)
-        parent, base = os.path.dirname(root), os.path.basename(root)
-        for p in glob.glob(os.path.join(parent, base + "-watch-*", "tmp")):
+        out = subprocess.run(
+            ["git", "-C", _PROJECT_ROOT, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            p = os.path.join(line.split(" ", 1)[1].strip(), "tmp")
             if os.path.isdir(p) and p not in dirs:
                 dirs.append(p)
     except Exception:
         pass
+    # 退回旧命名 glob（git 不可用 / 非 git 环境）：宁可多扫几毫秒，不漏一份日志。
+    try:
+        root = _PROJECT_ROOT.rstrip(os.sep)
+        parent, base = os.path.dirname(root), os.path.basename(root)
+        for pat in ("-watch-*", "-*"):
+            for p in glob.glob(os.path.join(parent, base + pat, "tmp")):
+                if os.path.isdir(p) and p not in dirs:
+                    dirs.append(p)
+    except Exception:
+        pass
     return dirs
+
+
+def _active_log_dates(now=None):
+    """「当前这一场盯盘」可能用的日志日期集合（紧凑 `YYYYMMDD`，2026-11-22 T202HKUS 立）。
+
+    为什么不是一个日期：采样日志文件名按**该市场的交易日**命名——`monitor_segment.py` 的
+    `trading_date_str()` 对美股取美东日期、对港股取本机（北京）日期；而守卫过去一直拿北京
+    日期当「今天」。美股一个 ET 交易日横跨北京零点（ET 11:00 = 北京次日 00:00），一过零点
+    `monitor_log_*_<北京今天>_*` 就一个都匹配不到 →「今天开过盯盘」的前提恒假 →
+    `_is_monitoring_session()` 恒 False → stop 分支的断链兜底**整段跳过**。
+    2026-11-20 实录：采样断在 ET 11:03（= 北京 11-21 00:03），此后每个回合的兜底提醒全部静默。
+
+    返回北京日期与美东日期的并集（同一自然日时只有一个元素）；zoneinfo 不可用时退化为
+    北京日期 + 「减 12 小时」粗估（与 monitor_segment 的同名兜底同口径）。
+    """
+    now = now or datetime.now()
+    dates = {now.strftime("%Y%m%d")}
+    try:
+        from zoneinfo import ZoneInfo
+        dates.add(now.astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d"))
+    except Exception:
+        try:
+            dates.add((now - timedelta(hours=12)).strftime("%Y%m%d"))
+        except Exception:
+            pass
+    return dates
+
+
+def _active_dash_dates(now=None):
+    """`_active_log_dates` 的带连字符形态（`YYYY-MM-DD`），供 JSON 里的 date 字段比对用。"""
+    return {f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in _active_log_dates(now)}
 
 
 def sampling_log_age(now=None):
@@ -772,26 +832,35 @@ def session_market(sid):
     if not sid:
         return None
     stag = session_tag(sid)
-    today = datetime.now().strftime("%Y-%m-%d")
     # ① 采样脚本写的会话→市场映射（最准）
+    # 2026-11-22 T202HKUS：两处修正——目录走 `_log_dirs()`（worktree 会话的映射写在
+    # 会话自己的 tmp/，只扫主仓库根本读不到）；日期认「本机口径 date」或「市场口径
+    # market_date」任一，避开「美股跨北京零点后映射被判隔日」的漏洞。
     try:
-        p = os.path.join(TMP_DIR, f"monitor_market_{stag}.json")
-        if os.path.isfile(p):
+        _dates = _active_dash_dates()
+        p_name = f"monitor_market_{stag}.json"
+        for _d in _log_dirs():
+            p = os.path.join(_d, p_name)
+            if not os.path.isfile(p):
+                continue
             with open(p) as f:
                 d = json.load(f)
-            if d.get("date") == today and d.get("market") in ("HK", "US"):
+            if (str(d.get("date")) in _dates or str(d.get("market_date")) in _dates) \
+                    and d.get("market") in ("HK", "US"):
                 return d["market"]
     except Exception:
         pass
     # ② 当日开仓 intent 的标的前缀（取本会话最后一条）
+    # 2026-11-22 T202HKUS：日期认「北京 + 美东」任一（旧实现只用北京日期）。
     try:
         intent = os.path.join(STATE_DIR, "trade_intent.log")
         if os.path.isfile(intent):
+            _dash_dates_2 = _active_dash_dates()
             mk = None
             with open(intent) as f:
                 for line in f:
                     line = line.strip()
-                    if not line or today not in line:
+                    if not line or not any(_x in line for _x in _dash_dates_2):
                         continue
                     try:
                         rec = json.loads(line)
@@ -826,24 +895,36 @@ def session_market(sid):
     return None
 
 
-def sampled_markets_today():
+def sampled_markets_today(now=None):
     """今天有采样日志的市场集合（从 `monitor_log_{MARKET}_{SYMBOL}_{DATE}_{MODE}.csv` 解析）。
 
     用于 session_market() 取不到值时的兼底：集合内**所有**市场都不在交易窗口时，
     说明今天盯的场子全收盘了（典型：只盯过美股的会话，在港股盘中不应被叫醒）。
+
+    2026-11-22 T202HKUS：日期口径改成 `_active_log_dates()`（北京 + 美东两个日历都认），
+    并补一条「最近 12 小时更新过」的兜底——旧实现只认北京日期的文件名，美股一过北京
+    零点就返回空集合，兼底也跟着失明。
     """
     out = set()
-    today = datetime.now().strftime("%Y%m%d")
+    now = now or datetime.now()
+    dates = _active_log_dates(now)
+    recent = now.timestamp() - 12 * 3600
     for d in _log_dirs():
         try:
             for f in os.listdir(d):
                 if not (f.startswith("monitor_log_") and f.endswith(".csv")):
                     continue
-                if f"_{today}_" not in f:
-                    continue
                 mk = f[len("monitor_log_"):].split("_")[0].upper()
-                if mk in ("HK", "US"):
+                if mk not in ("HK", "US"):
+                    continue
+                if any(f"_{x}_" in f for x in dates):
                     out.add(mk)
+                    continue
+                try:
+                    if os.path.getmtime(os.path.join(d, f)) >= recent:
+                        out.add(mk)
+                except OSError:
+                    pass
         except OSError:
             continue
     return out
@@ -873,8 +954,15 @@ def _is_monitoring_session(sid):
     大于这个窄缝的漏提醒，权衡后收窄。
     """
     try:
-        import glob as _glob
-        today = datetime.now().strftime("%Y%m%d")
+        # 2026-11-22 T202HKUS：日志 / 映射文件全部走 `_log_dirs()` + 双日历口径，
+        # 见 `_active_log_dates` 的说明。旧实现有三个独立漏洞叠在一起：① 只看主仓库
+        # tmp，worktree 盯盘的日志一份都看不到（T206US 把调用处改成走 `_log_dirs()`，
+        # 但 `_log_dirs()` 自己只 glob `-watch-*` 命名的目录——跟现行 worktree 命名
+        # `<仓库名>-<事项>` 完全对不上，等于没修）；② 日期只用北京日历，美股一过北京
+        # 零点对不上 ET 日期的日志名；③ 判③的 intent 与判④的映射文件也各用一个北京
+        # 日期。三处任一命中就蹲守卫，而 2026-11-20 的采样断点（ET 11:03）恰好同时踩中。
+        _dates = _active_log_dates()
+        _dash_dates = _active_dash_dates()
         # 前提：今天没有任何采样日志 → 没有会话开过盯盘。
         # ⚠️ 2026-11-22 修（T206US）：必须跨主仓库 tmp 与 worktree tmp 查——盯盘跑在
         # worktree 里时采样 log 写在 worktree 自己的 tmp/（worktree_start.py 刻意让
@@ -884,9 +972,29 @@ def _is_monitoring_session(sid):
         # 采样链静默 45 小时直到用户发问。`_log_dirs()` 早在 #37/#73 就支持跨 worktree，
         # 本函数当时漏改。
         _has_today_log = False
+        _recent = datetime.now().timestamp() - 12 * 3600
         for _d in _log_dirs():
-            if _glob.glob(os.path.join(_d, f"monitor_log_*_{today}_*.csv")):
-                _has_today_log = True
+            if not os.path.isdir(_d):
+                continue
+            try:
+                names = os.listdir(_d)
+            except OSError:
+                continue
+            for _f in names:
+                if not (_f.startswith("monitor_log_") and _f.endswith(".csv")):
+                    continue
+                # ① 文件名里带「本场」任一日历口径（北京 / 美东）的日期
+                if any(f"_{_x}_" in _f for _x in _dates):
+                    _has_today_log = True
+                    break
+                # ② 兜底：最近 12 小时更新过的日志（覆盖命名口径漂移、futu_ws 用本机日期等分歧）
+                try:
+                    if os.path.getmtime(os.path.join(_d, _f)) >= _recent:
+                        _has_today_log = True
+                        break
+                except OSError:
+                    pass
+            if _has_today_log:
                 break
         if not _has_today_log:
             return False
@@ -925,24 +1033,29 @@ def _is_monitoring_session(sid):
                 except OSError:
                     pass
         # ④ 本会话今天跑过采样段（采样脚本段启动时写 tmp/monitor_market_{stag}.json，T179）
+        # 2026-11-22 T202HKUS：日期认「本机 date」或「市场 market_date」任一（美股跨北京零点后
+        # 旧的单一日历比对会判定隔日）。
         try:
             _mp_name = f"monitor_market_{session_tag(sid)}.json"
             for _d in _log_dirs():  # 跨 worktree（采样脚本段启动时写在会话自己的 tmp）
                 mp = os.path.join(_d, _mp_name)
-                if os.path.isfile(mp):
-                    with open(mp) as f:
-                        if json.load(f).get("date") == datetime.now().strftime("%Y-%m-%d"):
-                            return True
+                if not os.path.isfile(mp):
+                    continue
+                with open(mp) as f:
+                    _rec = json.load(f)
+                if str(_rec.get("date")) in _dash_dates or str(_rec.get("market_date")) in _dash_dates:
+                    return True
         except Exception:
             pass
         intent = os.path.join(STATE_DIR, "trade_intent.log")
         if os.path.isfile(intent):
             try:
-                today_dash = datetime.now().strftime("%Y-%m-%d")
+                # 2026-11-22 T202HKUS：日期认「北京 + 美东」任一（旧实现只用北京日期，美股过
+                # 零点后写于前一北京日的开仓行被判隔日 → 本判据也跟着失效）。
                 with open(intent) as f:
                     for line in f:
                         line = line.strip()
-                        if not line or today_dash not in line:
+                        if not line or not any(_x in line for _x in _dash_dates):
                             continue
                         try:
                             rec = json.loads(line)

@@ -70,6 +70,30 @@
 
 **断层恢复也补了全局对账**：`resume.py` 收尾除了原有的 `actions_check.py` 开平闭环检查，再跑一次 `position_watchdog.global_reconcile()`——把「当日 actions 全局持仓 / 模拟账户实持 / 实盘账户实持」三项并排打出来，专治两种视角盲区：会话死亡期间被别人平掉的仓、以及用户在 App 手动开的仓（actions 里没有记录）。
 
+### 第五道防线：盯盘中断外部看护 `sampling_watchdog.py`（2026-11-22 立，T202HKUS）
+
+**为什么还要再加一道**（2026-11-20 实录）：美股会话在 ET 11:03 平仓后没重启采样段，采样链当场断掉，而**此后整场再没有发生过任何回合**——没有段结束通知、AI 不会自己醒来。而守卫的断链兜底挂在 `agent_settled`（回合静止）上，**没有回合就没有触发点**，所以兜底再准也发不出东西：后半场 5 小时无人盯盘，停盯收尾迟到约 24 小时，直到用户发问。结论是「靠会话内的提醒」有个前提——会话得先有个回合；这个前提塌了，必须有会话外的看护。
+
+**同一次修复里先把守卫自身的三个漏洞补掉**（否则外部看护一告警、守卫也还是叫不醒）：
+
+1. **日志目录枚举**：`monitor_guard._log_dirs()` 旧实现按目录名 `<仓库名>-watch-*` glob，而项目 2026-11-09 起的 worktree 命名是 `<仓库名>-<事项>`（`trading-agent-t203us-…` 这种），于是**真实 worktree 的 `tmp/` 一个都扫不到**——T206US 把三处调用改成走本函数，可本函数自己就漏了，等于没修。现改走 `git worktree list --porcelain` 权威枚举（git 不可用时退回旧 glob）。
+2. **日期口径**：采样日志文件名按**该市场的交易日**命名（`monitor_segment.trading_date_str()` 对美股取美东日期），而守卫一直拿**北京日期**当「今天」。美股一个 ET 交易日横跨北京零点（ET 11:00 = 北京次日 00:00），过零点后 `monitor_log_*_<北京今天>_*` 一个都匹配不到 →「今天开过盯盘」的前提恒假 → `_is_monitoring_session()` 恒 False → stop 分支整段跳过。**11-20 的断点恰好在 ET 11:03 = 北京 11-21 00:03**，两个 bug 叠在一起。现由 `_active_log_dates()` 统一返回「北京 + 美东」两个日历，判①前提 / 判③开仓 intent / 判④会话映射 / `session_market` / `sampled_markets_today` 全部改用同一套口径；`mark_session_market()` 额外写 `market_date`。
+3. **空转硬门的日志统计**：`sampling_log_run_seconds()` 同样只扫主仓库 + 只认北京日期，worktree / 跨零点场景恒返回 None，已一并改为 `_log_dirs()` + 双日历。
+
+**外部看护本体**（`hooks/sampling_watchdog.py` + `hooks/com.daytrading.sampling-watchdog.plist`，launchd 每 60 秒）：完全独立于任何会话，每次只看三件事实——
+
+1. **窗口**：直接复用 `monitor_guard.in_hk_session` / `in_us_session`（不另写一套，避免漂移）；
+2. **本场在盯**：存在**本市场**、**本场日期**（北京 / 美东任一）的 `monitor_log`；只盯过港股、现在美股盘中的场景不会误报；
+3. **真断了**：段进程不在（`sampling_process_alive`）+ 本市场最后一份日志已超 `GAP_ALERT_SECONDS`（300 秒；正常段间空窗只有几秒）。
+
+三条同时成立就做两件事：**① 唤醒会话**——从 `tmp/monitor_market_*.json` 找出盯这个市场的会话，用 `pi-intercom send` 直接发一条「外部看护：盘中断链 N 分钟，请立刻起下一段」（消息进来就会触发一个回合）；**② 发飞书**——会话已死 / 不在线 / intercom 不通时的兜底，用户在手机上能看到。
+
+**节流与静默**：同一市场 10 分钟内只告警一次、每个交易日每个市场最多 6 次（会话真死时不整夜刷屏）；空仓日 / 盘外 / 正常段间空窗 / 已正常停盯（`state/stop_done_<市场>_<交易日>*.txt` 晚于最后一份日志）一律静默。**只对确认在线且 cwd 在本项目（主工作区或本项目 worktree）的会话发 intercom**——pi-intercom 的 `--to <id>` 在目标不在线时会退回「唯一在线会话」，不筛就会把「盘中断链」谎报给无关的 agent（2026-11-22 实测）。
+
+**部署与自愈**：`preflight.py` 的 `_ensure_watcher()` 每次盯盘启动时自动部署 / 修复 / 加载，并校验心跳 `state/sampling_watchdog_beat.json`（5 分钟内必须更新，否则红字报「脚本没真跑」）——这条心跳是 2026-11-17 教训的延伸（旧监视器只判「在 launchctl list 里」就报 OK，实际路径失效后静默失败 6 天）。手工安装 / 排障：`bash hooks/install_sampling_watchdog.sh`，现状判定：`python3 hooks/sampling_watchdog.py --status`。
+
+**验证**（`tmp/verify_t202.py` + `tmp/verify_t202_watchdog.py`，假时钟复现 11-20 时点）：守卫侧——修复前同一场景判定「非盯盘会话」且 stop 分支全程静默（复现 bug）、修复后注入断链强提醒；宽限内（最后采样 5 秒前）与收盘后（ET 20:00）均静默。看护侧——盘中本场断链触发「飞书 + 唤醒会话」；收盘后 / 段进程在跑 / 已正常停盯 / 只有另一市场日志 四种情形静默；节流冷却与每日上限、换交易日解锁；飞书文案通过内容过滤。
+
 ## 时间断层哨兵（被动感知，`monitor_segment.py` 内）
 
 `monitor_segment.py` 启动时读各标的 log 最后采样时间，距现在 ≥ 5 分钟（正常段间循环 < 1 分钟）即输出醒目警告：「⚠️ 时间断层哨兵：距上次采样 X 分钟，先跑 `resume.py` 重建上下文、刷新现价，禁止直接用断层前旧数据下单。」——即便 AI 没主动意识到断层，脚本强制提醒（AI 不能只靠记忆执行规定、要靠工具强制，见 `references/trading-strategy.md`「盘中动态修正方向」）。
