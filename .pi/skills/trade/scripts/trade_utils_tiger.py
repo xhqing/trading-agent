@@ -2715,9 +2715,16 @@ def mark_session_market(market, stag=None):
         # skill_dir = .pi/skills/trade → 上三级 = 项目根（trade → skills → .pi → 根）
         tmp_dir = os.path.abspath(os.path.join(skill_dir, '..', '..', '..', 'tmp'))
         os.makedirs(tmp_dir, exist_ok=True)
+        # 2026-11-22 T202HKUS：额外写 `market_date`（该市场交易日）——守卫的「今天」不再
+        # 只认北京日历（美股 ET 交易日横跨北京零点，只写本机日期会让跨零点后的映射被判隔日）。
+        try:
+            _mdate = market_date_of(mk.lower())
+        except Exception:
+            _mdate = _dt.now().strftime('%Y-%m-%d')
         with open(os.path.join(tmp_dir, f'monitor_market_{sid}.json'), 'w') as f:
             _json.dump({'market': mk, 'session_tag': sid,
                         'date': _dt.now().strftime('%Y-%m-%d'),
+                        'market_date': _mdate,
                         'updated': _time.time()}, f, ensure_ascii=False)
         return True
     except Exception:

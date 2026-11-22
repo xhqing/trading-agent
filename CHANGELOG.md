@@ -1,3 +1,16 @@
+## [Unreleased]
+
+### 修复（盯盘断链兜底从未生效：跨 worktree 路径 + 跨北京零点日期双杀，并补一层会话外看护，2026-11-22 用户立，T202HKUS）
+
+- **为什么改**：2026-11-20 美股实录——平仓后没重启采样段，采样链断在 ET 11:03，此后约 5 小时无人盯盘、停盯收尾迟到约 24 小时。原以为 T206US（`_log_dirs()` 跨 worktree）已修好，实测仍未生效，读码后确认是**三个独立漏洞叠在一起**，而断点时刻恰好同时踩中。
+- **漏洞一：`_log_dirs()` 自己只认 `-watch-*`**。它按目录名 `<仓库名>-watch-*` glob，而项目 2026-11-09 起的 worktree 命名规范是 `<仓库名>-<事项>`（`trading-agent-t203us-…`、`trading-agent-position-state-check`），于是**真实 worktree 的 `tmp/` 一个都扫不到**——T206US 把三处调用改成走本函数，可本函数自己就漏了，等于没修。现改走 `git worktree list --porcelain` 权威枚举（与 `preflight._ensure_watcher()` 取稳定根同口径），git 不可用时退回旧 glob。
+- **漏洞二：日期口径错配（决定性）**。采样日志文件名按**该市场的交易日**命名（`monitor_segment.trading_date_str()` 对美股取美东日期），而守卫一直拿**北京日期**当「今天」。美股一个 ET 交易日横跨北京零点（ET 11:00 = 北京次日 00:00），过零点后 `monitor_log_*_<北京今天>_*` 一个都匹配不到 →「今天开过盯盘」的前提恒假 → `_is_monitoring_session()` 恒 False → stop 分支**整段跳过**。11-20 的断点正好是 ET 11:03 = 北京 11-21 00:03。现新增 `_active_log_dates()` / `_active_dash_dates()`（北京 + 美东两个日历），判①前提 / 判③开仓 intent / 判④会话映射 / `session_market` / `sampled_markets_today` / `sampling_log_run_seconds` 全部统一到这套口径；`mark_session_market()` 额外写 `market_date`，跨零点后映射不再被判隔日。
+- **漏洞三：会话没有回合 = 兜底没有触发点**（这是 T202 记录里「5 小时无盯盘」的真正成因）。守卫的断链提醒挂在 `agent_settled` 上，而 11-20 断链之后整场再没有任何回合（无段结束通知、AI 不会自己醒）。所以新增 **`hooks/sampling_watchdog.py` + `hooks/com.daytrading.sampling-watchdog.plist`**（launchd 每 60 秒，完全独立于会话）：窗口内 + 本市场本场有采样日志 + 段进程不在 + 最后一份日志超 300 秒 + 未见正常停盯标记 → ① 用 `pi-intercom` 唤醒盯该市场的会话（消息进来触发一个回合，它会重启采样段）；② 发飞书兜底。节流：同市场 10 分钟一次、每交易日每市场最多 6 次；空仓日 / 盘外 / 正常段间空窗 / 已正常停盯（`stop_done_<市场>_<交易日>*.txt` 晚于最后一份日志）一律静默。
+- **配套**：`preflight._ensure_watcher()` 扩展为第三只守护（自动部署 / 自愈 plist，并校验心跳 `state/sampling_watchdog_beat.json` 是否 5 分钟内更新——只判「在 launchctl 里」正是 2026-11-17 那类静默失败的成因）；新增 `hooks/install_sampling_watchdog.sh` 供手工安装 / 排障；`references/monitoring.md` 新增「第五道防线」节，`AGENTS.md` 的 hooks 段落补一句指针。
+- **intercom 投递安全（2026-11-22 实测）**：`pi-intercom send --to <id>` 在目标不在线时会**退回到「唯一在线会话」**——不筛就会把「盘中断链」谎报给无关的 agent。看护因此先 `pi-intercom list --json` 确认目标在线、且其 cwd 在本项目（主工作区或本项目 worktree）才发，否则只用飞书兜底。
+- **回归风险**：低-中。守卫侧只放宽「今天」的日期口径与目录枚举（判定方向不变：仍要求段进程不在 + 日志超过宽限），并保留两层兜底（文件名日期匹配，或最近 12 小时内更新）；对非盯盘会话的误唤醒风险由原有四判据 + 市场窗口门挡住（`tmp/verify_t202.py` 的宽限 / 收盘后两例已验证静默）。看护侧是纯新增进程，异常一律静默退出，不写任何业务状态；唯一写入是自身的 `state/sampling_watchdog.json` 节流记录与心跳。
+- **验证**：`tmp/verify_t202.py`（假时钟钉在 ET 11-20 11:10 = 北京 11-21 00:10）9/9 通过——含「修复前同一场景判定非盯盘会话、stop 分支全程静默」（复现 bug）与「修复后注入断链强提醒」的对照，以及宽限内、收盘后两例静默；`tmp/verify_t202_watchdog.py` 9/9 通过——盘中断链触发（飞书 + 唤醒）、收盘后 / 段进程在跑 / 已正常停盯 / 只有另一市场日志均静默、节流冷却与每日上限、换交易日解锁、飞书文案过内容过滤；真实链路实发一条飞书 + 一条 intercom（确认 message_id 与投递目标）。所有改动文件 `py_compile` / `bash -n` / `plutil -lint` 通过。
+
 ## [0.12.0] - 2026-11-22
 
 ### 新增（持仓定时飞书提醒：按美东时刻给指定持仓发提醒，2026-11-22 用户立，T203US）

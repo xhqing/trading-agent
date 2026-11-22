@@ -504,7 +504,7 @@ def _ensure_watcher():
                 return True, ""
         return False, ((r.stderr or r.stdout).strip() if r else "未知错误")
 
-    def _ensure_one(label, human, heartbeat_secs=None):
+    def _ensure_one(label, human, heartbeat_secs=None, beat_file="watchdog_beat.json"):
         short = label.split(".")[-1]
         tpl = _os.path.join(_repo_root(), "hooks", f"{label}.plist")
         dst = _os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
@@ -546,7 +546,7 @@ def _ensure_watcher():
         elif not problems:
             print(f"🛡️ {human}: 已部署、已加载、plist 路径有效")
         if heartbeat_secs:
-            beat = _os.path.realpath(_os.path.join(root, "state", "watchdog_beat.json"))
+            beat = _os.path.realpath(_os.path.join(root, "state", beat_file))
 
             def _age():
                 try:
@@ -574,6 +574,12 @@ def _ensure_watcher():
     _ensure_one("com.daytrading.position-watchdog",
                 "持仓看护 watchdog（持仓无人盯 / 疑似被动平仓 / 收盘仍有仓）",
                 heartbeat_secs=300)
+    # 2026-11-22 T202HKUS：盯盘中断外部看护——会话「没有回合」时 monitor_guard 的
+    # agent_settled 兜底根本没有触发点（2026-11-20 实录：断链后 5 小时无人察觉）。
+    # 这一项独立于任何会话，段进程不在 + 本市场日志超 300 秒就唤醒会话 + 发飞书。
+    _ensure_one("com.daytrading.sampling-watchdog",
+                "盯盘中断看护 watchdog（段进程不在 + 本市场超 300 秒无数据）",
+                heartbeat_secs=300, beat_file="sampling_watchdog_beat.json")
 
 _ensure_watcher()
 

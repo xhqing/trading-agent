@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 盯盘中断外部看护 launchd 配置（2026-11-22 立，T202HKUS）。
+
+     作用：每 60 秒触发 hooks/sampling_watchdog.py——**完全独立于 AI 会话**地看「盘中该盯、
+     今天在盯、却断了」这一件事：段进程不在 + 本市场最后一份采样日志超过 300 秒 + 未见正常
+     停盯标记 → 用 pi-intercom 唤醒盯该市场的会话（触发一个回合让它重启采样段），同时发飞书
+     兜底。空仓日 / 盘外 / 正常段间空窗 / 已正常停盯 一律静默。
+
+     为什么必须独立于会话（2026-11-20 实录）：会话在 ET 11:03 断链后再没有发生任何回合，
+     而 `monitor_guard.py` 的兜底挂在 `agent_settled`（回合静止）上——没有回合就没有触发点，
+     那个兜底发不出任何东西，整场后半段无人盯盘、收尾迟到约 24 小时。
+
+     部署（自动）：preflight.py 的 _ensure_watcher() 在每次盯盘启动时自动部署 / 自愈
+     （plist 与仓库模板不一致、路径失效、未加载都自动修复）。手动：
+       bash hooks/install_sampling_watchdog.sh
+     卸载（仅用户明确要求时）：
+       bash hooks/install_sampling_watchdog.sh --unload
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.daytrading.sampling-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/xhq/Developer/trading-agent/hooks/sampling_watchdog.py</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/daytrading-sampling-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/daytrading-sampling-watchdog.err</string>
+</dict>
+</plist>
