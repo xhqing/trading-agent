@@ -101,6 +101,56 @@ def row_key(r):
             str(r.get("exit_price")), str(r.get("shares")))
 
 
+EXCLUDE_FILE = "review_exclude.json"
+
+
+def load_excludes():
+    """异常样本排除清单（2026-11-22 立，T207US）。
+
+    为什么需要：脚本 bug 造成的「凭空开仓」「下单即被止损平掉」这类成交不是策略决策的
+    产物——进累积样本会污染 EV / 胜率 / R 分布，进而影响两闸判据（它们直接决定实盘开
+    仓许可）。2026-11-20 实录两笔：① 滑点使成交价越过止损价、下单瞬间即被平掉（slip_R
+    1.09）；② 止损腿补挂方向挂反、空仓下凭空开出 515 股裸空（T204US）。
+    清单放 reviews/ 下（入库），异常样本可追溯、不随时间消失。
+    """
+    p = ROOT / "reviews" / EXCLUDE_FILE
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data.get("entries") or []
+    except Exception:
+        return []
+
+
+def is_excluded(row, excludes):
+    """按 date + symbol + direction + shares + entry_price 匹配异常样本。
+
+    用「开仓侧特征」匹配而非平仓价：未平仓的异常单在平仓后才会进样本，那时平仓价才存在，
+    但开仓价与数量在事故当时就定了，用它能提前把风险锁死。
+    """
+    if not excludes:
+        return False
+    try:
+        _d = str(row.get("date"))
+        _s = str(row.get("symbol"))
+        _dir = str(row.get("direction"))
+        _q = int(float(row.get("shares") or 0))
+        _px = float(row.get("entry_price") or 0)
+    except Exception:
+        return False
+    for e in excludes:
+        try:
+            if (_d == str(e.get("date")) and _s == str(e.get("symbol"))
+                    and _dir == str(e.get("direction"))
+                    and _q == int(float(e.get("shares") or 0))
+                    and abs(_px - float(e.get("entry_price") or 0)) < 0.02):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def sec_type_map(rows):
     """symbol → 证券类型（stock / etf），从历史样本继承（review 用它定港股印花税）。"""
     m = {}
@@ -372,8 +422,18 @@ def main():
 def _run(a):
     date = a.date or T.market_date_of(a.market)
     src = latest_csv(a.market)
-    rows = read_rows(src)
-    today_rows = daily_rows(a.market, date, a.account, sec_type_map(rows))
+    _excl = load_excludes()
+    rows = [r for r in read_rows(src) if not is_excluded(r, _excl)]
+    _dropped = 0
+    _raw_today = daily_rows(a.market, date, a.account, sec_type_map(rows))
+    today_rows = []
+    for _r in _raw_today:
+        if is_excluded(_r, _excl):
+            _dropped += 1
+            continue
+        today_rows.append(_r)
+    if _dropped:
+        print(f"🚫 异常样本已排除 {_dropped} 笔（见 reviews/{EXCLUDE_FILE}）：不进累积样本与两闸判据")
 
     merged = list(rows)
     seen = {row_key(r) for r in rows}
