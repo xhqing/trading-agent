@@ -875,8 +875,20 @@ def _is_monitoring_session(sid):
     try:
         import glob as _glob
         today = datetime.now().strftime("%Y%m%d")
-        # 前提：今天没有任何采样日志 → 没有会话开过盯盘
-        if not _glob.glob(os.path.join(TMP_DIR, f"monitor_log_*_{today}_*.csv")):
+        # 前提：今天没有任何采样日志 → 没有会话开过盯盘。
+        # ⚠️ 2026-11-22 修（T206US）：必须跨主仓库 tmp 与 worktree tmp 查——盯盘跑在
+        # worktree 里时采样 log 写在 worktree 自己的 tmp/（worktree_start.py 刻意让
+        # tmp/ 每场独立），只扫主仓库 TMP_DIR 会恒返回 False，导致本函数对**所有
+        # worktree 盯盘会话**判定「不是盯盘会话」→ stop 分支的断链兜底从此不生效。
+        # 2026-11-20 实录：美股会话在 worktree 盯盘，段结束后漏启下一段，兜底从未触发，
+        # 采样链静默 45 小时直到用户发问。`_log_dirs()` 早在 #37/#73 就支持跨 worktree，
+        # 本函数当时漏改。
+        _has_today_log = False
+        for _d in _log_dirs():
+            if _glob.glob(os.path.join(_d, f"monitor_log_*_{today}_*.csv")):
+                _has_today_log = True
+                break
+        if not _has_today_log:
             return False
         if not sid:
             return False
@@ -902,21 +914,25 @@ def _is_monitoring_session(sid):
         # （收盘窗口 / --force 用户喊停，均已过其内置停盯边界时间闸）落当日停盯标记
         # tmp/stopped_sessions_YYYYMMDD.txt；此处判③前先查标记，已停盯直接 False。
         # 重新盯盘时 preflight 注册会撤销本会话标记（同日重启场景），跨日按文件名自然失效。
-        stopped = os.path.join(TMP_DIR, f"stopped_sessions_{datetime.now().strftime('%Y%m%d')}.txt")
-        if os.path.isfile(stopped):
-            try:
-                with open(stopped) as f:
-                    if sid in f.read().splitlines():
-                        return False
-            except OSError:
-                pass
+        _stop_name = f"stopped_sessions_{datetime.now().strftime('%Y%m%d')}.txt"
+        for _d in _log_dirs():  # 跨 worktree（停盯标记由 monitor_unregister.sh 写在会话自己的 tmp）
+            stopped = os.path.join(_d, _stop_name)
+            if os.path.isfile(stopped):
+                try:
+                    with open(stopped) as f:
+                        if sid in f.read().splitlines():
+                            return False
+                except OSError:
+                    pass
         # ④ 本会话今天跑过采样段（采样脚本段启动时写 tmp/monitor_market_{stag}.json，T179）
         try:
-            mp = os.path.join(TMP_DIR, f"monitor_market_{session_tag(sid)}.json")
-            if os.path.isfile(mp):
-                with open(mp) as f:
-                    if json.load(f).get("date") == datetime.now().strftime("%Y-%m-%d"):
-                        return True
+            _mp_name = f"monitor_market_{session_tag(sid)}.json"
+            for _d in _log_dirs():  # 跨 worktree（采样脚本段启动时写在会话自己的 tmp）
+                mp = os.path.join(_d, _mp_name)
+                if os.path.isfile(mp):
+                    with open(mp) as f:
+                        if json.load(f).get("date") == datetime.now().strftime("%Y-%m-%d"):
+                            return True
         except Exception:
             pass
         intent = os.path.join(STATE_DIR, "trade_intent.log")

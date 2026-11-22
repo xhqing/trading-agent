@@ -1,5 +1,7 @@
 - [x] **T204US** 修 `ensure_stop_protection_us` / `ensure_stop_protection_tiger` 的止损腿方向bug：补挂止损腿时按持仓方向定买卖方向（空头持仓 → BUY STP），并加「空仓不得补挂任何 STP」硬拦——2026-11-20 12:09 ET 实录：空仓状态下补挂了 SELL STP 515 股，凭空开出裸空仓，属 T198 同类事故复发。✅**已完成**（完成：2026-11-22 13:20）`ensure_stop_protection_tiger` 加 ① 补挂前查持仓（无持仓 → skipped=no_position 不补挂、查询异常 → ok=False 报人工）② 补挂方向显式取反（开多→Sell STP、开空→Buy STP）③ 补挂数量改用账户实持；5 个离线场景验证通过，CHANGELOG 已记。
 
+- [x] **T206US** **worktree 盯盘会话的断链兜底从未生效**：`monitor_guard.py` 的 `_is_monitoring_session()` 三处路径（前提 log、停盯标记、monitor_market）只扫主仓库 `tmp/`，而 worktree 盯盘把采样日志写在 `worktree/tmp/` → 第一道前提恒 False → stop 分支整段跳过 → 「段结束没重启」强提醒对 worktree 会话从未执行。2026-11-20 实录：漏启下一段后静默 45 小时。✅**已完成**（完成：2026-11-22 13:35）三处改为遍历 `_log_dirs()`（跨 worktree），回归验证：同一场景修复后 True / 修复前 False。CHANGELOG 已记。
+
 ## 2026-11-17 T200/T201 归档（采样段仓位对账置顶 + 移损移盈二次读闸，代码已修）
 
 > 闭环路径：2026-11-17 用户「把橙色待办全部处理掉」→ 同一 worktree（`trading-agent-position-state-check` / `fix/position-state-check`）一次做完两条 + 排查 IP 池误报 → CHANGELOG 0.11.2。
