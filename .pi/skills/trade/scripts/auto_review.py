@@ -48,6 +48,7 @@ ROOT = SCRIPTS.parent.parent.parent.parent
 sys.path.insert(0, str(SCRIPTS))
 
 import review as RV                       # noqa: E402
+import change_tags as CT                  # noqa: E402
 import circuit_breaker as CB              # noqa: E402
 import trade_utils_tiger as T             # noqa: E402
 
@@ -371,6 +372,23 @@ def build_report(g, stats_today, stats_all):
     else:
         L.append("本场 0 笔成交。")
     L.append("")
+
+    # —— 样本分布变更点（2026-11-23 立，T209HKUS）：每次自动复盘都亮出来 ——
+    _tags = CT.load_tags()
+    if _tags:
+        _idx = CT.period_index(g["date"], _tags)
+        L += ["## 一·bis、样本分布变更点（change tag）", "",
+              "> 重大改动会改变「哪些单会成交 / R 怎么算 / 仓位多大 / 漏单多少」。"
+              "跨这些点的统计不能直接合并比较——做长期复盘前先看分期间对比"
+              "（`review.py` 会打印分期间表）。", "",
+              "| 日期 | 改动 | 影响 | 范围 |", "|---|---|---|---|"]
+        for t in _tags:
+            flag = "" if t.get("verified", True) else "（待确认）"
+            L.append(f"| {t['date']} | {t.get('title', '')}{flag} "
+                     f"| {CT.affects_label(t.get('affects'))} "
+                     f"| {'/'.join(t.get('scope') or [])} |")
+        L += ["", f"**本场（{g['date']}）属于期间：{CT.period_label(_idx, _tags)}**"
+                  f"——与该期间之前的样本不同质，别直接合并下结论。", ""]
 
     L += ["## 二、累积样本", ""]
     if stats_all and stats_all["N"]:

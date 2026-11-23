@@ -27,6 +27,10 @@ import sys
 SCENARIOS = ["下限情景", "实测金额", "平均风险", "上限情景"]
 DIAGS = ["买力折损率", "corr(R, M)", "分层"]
 HEAD_PAT = re.compile(r"金额口径四情景|四种金额口径|金额口径.{0,4}情景")
+# 样本分布变更点（2026-11-23 立，T209HKUS）：新报告必须亮出 change tag 提醒
+TAG_PAT = re.compile(r"样本分布变更点|change tag")
+TAG_CUTOFF = "2026-11-23"      # 该日及以后的报告必须有；更早的报告不追溯
+DATE_PAT = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 
 
 def check(path, require_diag=True):
@@ -45,6 +49,10 @@ def check(path, require_diag=True):
         for d in DIAGS:
             if d not in txt:
                 missing.append(f"诊断「{d}」")
+    # 变更点提醒：只对 2026-11-23 及以后的报告强制（旧报告不追溯）
+    m = DATE_PAT.search(os.path.basename(path))
+    if m and m.group(1) >= TAG_CUTOFF and not TAG_PAT.search(txt):
+        missing.append("样本分布变更点提醒（change tag，见 change_tags.py）")
     return (not missing), missing
 
 

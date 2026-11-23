@@ -276,6 +276,8 @@ python3 .pi/skills/trade/scripts/worktree_start.py --market us   # 或 hk
 
 **复盘工具**：`python3 scripts/review.py <trades.csv>` 一次性输出全套指标（样本明细、终局统计量、**金额口径四情景 + 三项诊断（2026-11-18 立，见下）**、过程指标分盈亏单、贝叶斯 P(EV>0)、频率派 CI、样本量规划、**末尾实盘熔断核对段**——两级判据机械判读 + 熔断状态三态建议，2026-09-12 立）；`python3 scripts/bayes_evolution.py` 输出 7 张序贯演化图。复盘产物放 `reviews/`（报告 `reviews/YYYY-MM-DD-review.md` + 同日 csv/png）。
 
+**⚠️ 样本分布变更点（change tag）也是复盘报告必含段（2026-11-23 用户立）**：每次**重大改动**（改变「哪些单会成交 / R 分子分母怎么算 / 单笔仓位规模 / 样本是否纳入 / 盯盘连续性」）都要在 `reviews/change-tags.json` 打一个时间戳 tag——用 `python3 scripts/change_tags.py add --date … --title … --affects … --why …`（affects 取值见 `--help`）。复盘时 `review.py` 会自动打印「变更点清单 + 按变更点分期间表」，并给出「能否合并解释」的结论；`auto_review.py` 生成的日常复盘报告也强制带这一节。`check_review_scenarios.py` 对 2026-11-23 及以后的报告校验该节是否存在。**为什么**：用户原话「重大改动可能改变交易样本的分布」——跨变更点直接合并会把两种筛选条件混成一个 EV。口径与判读见 `references/review-and-evaluation.md`「复盘数据变更点」节。
+
 **⚠️ 金额口径四情景是复盘报告必含段（2026-11-18 用户立）**：R 只是技能口径，不能直接乘 B 当金额——`E[P] = E[R]·E[M] + Cov(R,M)`，买力上限 / 止损距都会让各笔 M 不同。报告必须写全四种情景（**下限情景** `mean(R)×M_min` / **实测金额** `mean(P)` / **平均风险** `mean(R)×mean(M)` / **上限情景** `mean(R)×B`）与三项诊断（`s=M/B`、`corr(R,M)`、按 M 分层），并逐条解释「本场为什么是这个数」。做法：`review.py <csv> --fx <HKD/USD> --md-block` 直接输出可粘贴的 Markdown 块，收尾前跑 `python3 scripts/check_review_scenarios.py reviews/<报告>.md` 校验，不通过与演化图缺失同级——不算复盘完成。口径定义与判读规则见 `references/review-and-evaluation.md`「金额口径四情景」节。
 
 **详细方法论见 `references/review-and-evaluation.md`**（收到复盘指令时读它）：统计量定义与推导（EV 分解合并恒等、MAE / MFE / 回吐 / 锁利效率 η）、7 张序贯演化图的必含规范、样本量规划、多层评估框架、**实盘熔断机制（两级判据 + 复盘结尾必含「暂停 / 重启实盘」三态建议 + 实盘开仓闸 + 重启流程，2026-08-17 立判据 / 2026-09-12 机制化）**。盯盘时不必读、复盘时按此逐项统计。
