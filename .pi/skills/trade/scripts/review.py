@@ -56,6 +56,8 @@ CSV 字段（首行表头，逗号分隔；# 开头行当注释跳过）:
 依赖: scipy（无则退化：t→正态近似、χ²→Wilson-Hilferty，小样本偏乐观；建议装 scipy）。
 """
 import sys, csv, math, argparse, os
+from change_tags import (AFFECTS, affects_label, load_tags, period_index,
+                         period_label)
 from statistics import mean, stdev
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -224,6 +226,58 @@ def load_trades(path):
 
 
 # ---------- 统计 ----------
+def change_tag_block(trades, tags=None):
+    """打印「样本分布变更点」提醒块 + 按变更点分期间对比（2026-11-23 立，T209HKUS）。
+
+    为什么必须在复盘里强制显示（用户 2026-11-23 立）：重大改动会改变样本分布或 R 口径，
+    跨变更点直接合并统计会把两种筛选条件混成一个 EV，得出看似精确其实无意义的结论。
+    所以每次复盘先亮出变更点清单，再给分期间表；差异明显时明确写「不要合并解释」。
+    """
+    tags = load_tags() if tags is None else tags
+    if not tags:
+        return
+    print()
+    print("【样本分布变更点（change tag）】共 %d 个｜最近一个：%s %s"
+          % (len(tags), tags[-1]["date"], tags[-1].get("title", "")))
+    print("  ⚠️ 重大改动会改变「哪些单会成交 / R 怎么算 / 仓位多大 / 漏单多少」——"
+          "跨这些点不能直接合并比较，先看下面的分期间表再下结论。")
+    for t in tags:
+        flag = "" if t.get("verified", True) else "（待确认）"
+        print(f"    {t['date']}  {t.get('title', '')}{flag}"
+              f"｜影响：{affects_label(t.get('affects'))}")
+
+    # 分期间统计（只对带日期的样本做，无日期的忽略）
+    dated = [t for t in trades if t.get("date")]
+    if not dated:
+        return
+    buckets = {}
+    for t in dated:
+        buckets.setdefault(period_index(t["date"], tags), []).append(t)
+    if len(buckets) <= 1:
+        print(f"  本样本只落在 1 个期间（{period_label(list(buckets)[0], tags)}），暂不涉及跨点合并问题。")
+        return
+    print()
+    print("【按变更点分期间】（同一口径内才可比；期间之间不可比）")
+    print(f"  {'期间':<34}{'N':>5}{'胜率':>8}{'EV(R)':>9}{'胜赔':>8}{'败赔':>8}{'合计R':>9}")
+    evs = []
+    for idx in sorted(buckets):
+        sub = buckets[idx]
+        S = summarize(sub)
+        evs.append(S["EV"])
+        rw = "—" if S["RW"] != S["RW"] else f"{S['RW']:+.2f}"
+        rl = "—" if S["RL"] != S["RL"] else f"{S['RL']:+.2f}"
+        print(f"  {period_label(idx, tags):<34}{S['N']:>5}{S['p'] * 100:>7.1f}%"
+              f"{S['EV']:>+9.3f}{rw:>8}{rl:>8}{sum(S['R']):>+9.2f}")
+    if len(evs) >= 2:
+        spread = max(evs) - min(evs)
+        verdict = ("⚠️ 期间之间 EV 差异 %.3fR ≥ 0.2R——**不要把整段当一个样本解释**，"
+                   "结论需按期间分别陈述（或用变更点做分组变量）" % spread
+                   if spread >= 0.2 else
+                   "期间之间 EV 差异 %.3fR（< 0.2R），方向一致时可谨慎合并，但仍需在报告里注明跨了变更点" % spread)
+        print("  " + verdict)
+    print("  详见 references/review-and-evaluation.md「复盘数据变更点」节。")
+
+
 def summarize(trades):
     R = [t['R'] for t in trades]
     P = [t['P'] for t in trades]
@@ -637,6 +691,8 @@ def main():
     print("=" * 66)
     print(f"交易复盘 · N={N} 笔已平仓")
     print("=" * 66)
+
+    change_tag_block(trades)
 
     # 1. 样本明细
     print("\n【样本明细】（P / R 均为扣双边手续费后的净额；fee = 开+平两边手续费；"

@@ -1,0 +1,75 @@
+{
+  "_comment": "复盘数据变更点（change tag）。每次【重大改动】后必须追加一条：它标记的是「从这一天起，交易样本的分布/口径可能变了」，复盘时必须重点提醒、跨点不合并统计。维护命令：python3 .pi/skills/trade/scripts/change_tags.py add --date YYYY-MM-DD --title … --affects … --why …（详见 references/review-and-evaluation.md「复盘数据变更点」节）。affects 取值：sample_selection（哪些单会成交/被拦）｜r_denominator（R 分母 max_loss 口径）｜r_numerator（R 分子：盈亏/费用口径）｜position_size（单笔仓位规模 B/买力）｜inclusion（样本是否纳入）｜monitoring（盯盘连续性/漏单）。",
+  "tags": [
+    {
+      "date": "2026-08-24",
+      "title": "净赔率门槛 2.4 → 1.8（08-24）→ 1.2（08-25）",
+      "scope": ["HK", "US"],
+      "affects": ["sample_selection"],
+      "why": "门槛连续两轮下调，直接改变「哪些单能成交」：2.4 时代（08-06~08-24）EV +0.23R 与 1.2 时代（08-28 起）EV −0.529R 是不同筛选条件下的样本，不可合并比较。",
+      "evidence": "config.risk.min_net_odds=1.2（2026-08-25 下调）；CHANGELOG T119 对账 + references/trading-strategy.md「门槛沿革」节",
+      "source": "changelog",
+      "verified": true
+    },
+    {
+      "date": "2026-08-28",
+      "title": "R 分母改「净 max_loss」+ 印花税闸停用",
+      "scope": ["HK", "US"],
+      "affects": ["r_denominator", "sample_selection"],
+      "why": "分母从毛口径改为净口径（扣双边费用），同一笔的 R 整体变小；08-28 之前的 R 与之后不可直接比大小。同时个股印花税闸停用，放行了一批个股形态。",
+      "evidence": "CHANGELOG「美股费率/R 口径」相关条目与「回归风险与代价」段（明确写「2026-08-28 前的报告 / trades.csv 统计与新口径不可直接比大小」）",
+      "source": "changelog",
+      "verified": true
+    },
+    {
+      "date": "2026-09-18",
+      "title": "R 口径二次修正：entry 改用开仓订单 avg_fill（T152）+ 连败补记（T151）",
+      "scope": ["HK", "US"],
+      "affects": ["r_denominator", "inclusion"],
+      "why": "entry 从「含费摊薄的记录价」改为开仓订单成交均价，R 的分子分母同时受影响；同期补上被动平仓的连败补记与 actions 解析修复，历史样本的纳入范围也变了。",
+      "evidence": "CHANGELOG 0.3.0 段「批量办结待办 11 条」第 1~4 项（T151/T152 等）",
+      "source": "changelog",
+      "verified": true
+    },
+    {
+      "date": "2026-10-11",
+      "title": "（用户标定的上一条数据 tag，具体改动待确认）",
+      "scope": ["HK", "US"],
+      "affects": ["sample_selection"],
+      "why": "用户 2026-11-23 回忆「上一个时间戳 tag 定在 10 月 11 号」。当日 CHANGELOG 记录的是 pi 宿主接入 / 后台任务提醒等基础设施改动，未见交易判据变更；按用户标定先登记为数据分界，具体对应的改动待确认后补全 affects 与 why。",
+      "evidence": "用户口述（2026-11-23）；CHANGELOG 0.3.0 / 0.4.0 / 0.4.1（2026-10-11）",
+      "source": "user",
+      "verified": false
+    },
+    {
+      "date": "2026-10-24",
+      "title": "美股费率口径修正 + 全量重算历史（净赔率收紧）",
+      "scope": ["US"],
+      "affects": ["r_numerator", "sample_selection"],
+      "why": "补齐三项每笔最低与卖侧规费后，净赔率整体变小：小仓位 + 窄止损单普遍从「过 1.2 门槛」变成「不过」（实测 10-23 的 7 笔里 5 笔本应被拦），会显著减少该类成交笔数；同期历史样本按新口径全量重算。",
+      "evidence": "CHANGELOG 0.5.0 段「美股费率口径修正」（含 25 股 QQQ / 27 股 META 的实算对照）",
+      "source": "changelog",
+      "verified": true
+    },
+    {
+      "date": "2026-11-18",
+      "title": "auto 模式启用独立权益账本（B 随盈亏联动）",
+      "scope": ["US"],
+      "affects": ["position_size"],
+      "why": "auto 的单笔预算 B 改为读自身账本（不再读 signal 的 equity-log），权益随已实现盈亏变化 → 单笔股数、进而每笔 max_loss 与 R 的分母都会随之变化，跨该日期的仓位规模不可比。",
+      "evidence": "CHANGELOG 0.12.0 段「auto 模式启用独立权益账本」；state/auto_equity.json",
+      "source": "changelog",
+      "verified": true
+    },
+    {
+      "date": "2026-11-22",
+      "title": "盯盘断链兜底修复 + 会话外看护 + auto 会话复活（v0.12.1–v0.12.4）",
+      "scope": ["US"],
+      "affects": ["monitoring"],
+      "why": "修掉「worktree 目录枚举 + 北京/美东日期」两个 bug 后，回合静止的断链提醒恢复生效；新增看护（60 秒巡检、文件信箱唤醒）与 auto 模式会话复活。影响的是「样本完整性」：此前会话中途死掉会静默数小时（漏盯、漏止损、漏记），此后同类漏单应显著减少——跨该日期的「0 笔/异常少笔」交易日要按此解释，不要当成策略变化。",
+      "evidence": "CHANGELOG 0.12.1–0.12.4；hooks/monitor_guard.py / hooks/sampling_watchdog.py；TODO-archive.md T202HKUS",
+      "source": "changelog",
+      "verified": true
+    }
+  ]
+}
