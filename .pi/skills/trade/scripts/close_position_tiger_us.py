@@ -32,6 +32,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import trade_utils_tiger_us as U
 
 
+def _live_ref_price(quote, direction):
+    """平仓用的**实时**参考价：返回 (价格, 来源)。
+
+    ⚠️ 为什么不能用快照的 `last`（2026-11-23 实盘暴露）：RTH（常规时段）之外，富途快照的
+    `last` 常常还是**上一交易日收盘价**（stale），而 bid/ask 才是活的。本脚本原来取 `last`
+    去设触发价，于是在夜盘 / 盘前会出现「BUY STP 触发价 41.20 而市价 42.76」这种单——券商
+    直接拒：「The trigger price must be higher than the last traded price」，平仓 8 轮全废。
+    修法：空头回补 = BUY STP（触发价须在市价**之上**）→ 取 `ask`；平多 = SELL STP（触发价
+    须在市价**之下**）→ 取 `bid`；两者都没有才退回 `last`。
+    """
+    bid = quote.get("bid") if quote else None
+    ask = quote.get("ask") if quote else None
+    last = quote.get("last") if quote else None
+
+    def _ok(v):
+        try:
+            return float(v) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if direction == "short" and _ok(ask):
+        return float(ask), "ask（多头回补触发价须高于市价，RTH 外 last 不可信）"
+    if direction == "long" and _ok(bid):
+        return float(bid), "bid（平多触发价须低于市价，RTH 外 last 不可信）"
+    if _ok(last):
+        return float(last), "last（bid/ask 缺失时兜底）"
+    return None, "无可用价格"
+
+
 def _is_stop_order(o):
     """止损单判定（含 STP/STOP/TRAIL/LOSS 附加腿；2026-08-23 增补排除止盈单——PROFIT 腿
     落成单不能被止损路径误抓误撤）。"""
@@ -260,6 +289,18 @@ def main():
     # 触发价=现价（这是「没有止损单」场景的唯一处理方式）。
     result_base["path"] = "converge_loop（止损/止盈触发价交替逼近现价）"
     close_rounds = []
+    # 平仓前清场（2026-11-23 立）：该标的的**任何**工作单都占用可平额度——不只止损单，
+    # 残留的 HELD / LMT 也会让平仓单被拒「The order quantity you entered exceeds your
+    # current holdings」（当日实测：一张 42.76 的 HELD LMT 挡住了三次平仓尝试）。
+    try:
+        n_cancelled, cancelled_ids = U.cancel_all_working_orders_us(config, symbol)
+        if n_cancelled:
+            result_base["pre_close_cancelled_orders"] = cancelled_ids
+            print(f"ℹ️ 平仓前撤销该标的 {n_cancelled} 张工作单（释放可平额度）：{cancelled_ids}",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"⚠️ 平仓前清场异常（继续尝试平仓）：{e}", file=sys.stderr)
+
     max_rounds = 8
     filled = False
     fill_price = None
@@ -280,8 +321,12 @@ def main():
         if quote_now is None or quote_now.get("last") is None:
             close_rounds.append({"round": rnd, "event": "行情取不到，跳过本轮逼近（下轮再试）"})
             continue
-        px_now = float(quote_now["last"])
+        px_now, px_src = _live_ref_price(quote_now, direction)
+        if px_now is None:
+            close_rounds.append({"round": rnd, "event": "行情无可用价格（last/bid/ask 皆空），下轮再试"})
+            continue
         trig_now = U.round_to_tick_us(px_now)
+        close_rounds.append({"round": rnd, "event": f"参考价 {px_now}（来源 {px_src}）"})
 
         want_stop = (rnd % 2 == 1)
         active_stps, active_profits = _find_active_orders()
