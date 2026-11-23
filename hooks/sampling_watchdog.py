@@ -18,7 +18,10 @@
      自己的信箱，有请求就删掉并 `sendMessage(triggerTurn)` 唤醒一轮——AI 于是能重启采样段
      并补上缺的分析。全程只用「项目里的文件 + pi 扩展 API + tmux（项目既定的后台进程载体）」，
      不依赖任何第三方包或服务。
-  ② **叫不醒就自己接上**：没有候选会话、或请求投递 5 分钟仍没被认领（会话已死 / 没在跑），
+  ② **叫不醒就自己接上**：没有候选会话、或请求投递 5 分钟仍没被认领（会话已死 / 没在跑）——
+     **auto 模式会先尝试「复活会话」**（用项目自己的 pi 宿主在 tmux 里拉起一个接班会话，
+     接班指令见 `tmp/revive/revive_*.md`，内含「先核对持仓与止损腿、再起采样」的固定顺序）；
+     复活不可用（找不到 pi / 拉起失败 / 非 auto 模式）时才退回「自己起段」：
      看护按「本场最后在盯的标的与模式」用 tmux 起一段密采样——数据链不再断。
      接管痕迹写 `tmp/sampling_watchdog_takeover_<市场>.log`，AI 回来后读一眼就知道
      「这段时间是看护代跑的，分析要补」。
@@ -76,6 +79,14 @@ MAX_TARGETS = 4                    # 自己接管时最多盯几只（按最后�
 SEGMENT_SECONDS = 40               # 与 trade skill 的 40 秒密采样一致（脚本内部也夹到 40）
 SEGMENT_INTERVAL = 10
 WAKE_DIRNAME = "wake_requests"     # 会话自己 tmp 下的信箱目录（扩展每 15 秒看一次）
+
+# —— 会话复活（2026-11-22 立，用户要求：auto 模式下会话死了要把它救活） ——
+# 只在 auto 模式启用（signal 模式已不再维护）。判定「叫不醒」= 唤醒请求投出去
+# `WAKE_RECLAIM_SECONDS` 秒后仍躺在信箱里没被消费（会话进程已死 / 不再产生回合）。
+PI_BIN = os.environ.get("SAMPLING_WATCHDOG_PI") or "/opt/homebrew/bin/pi"
+REVIVE_MIN_INTERVAL_SECONDS = 600   # 两次拉起之间至少隔 10 分钟
+MAX_REVIVES_PER_DAY = 3             # 每个市场每个交易日最多拉起 3 次（防抖动成刷会话）
+REVIVE_BOOT_GRACE_SECONDS = 180     # 拉起后给新会话 3 分钟启动（跑 preflight / 起首段）
 STATE_PATH = os.path.join(STATE_DIR, "sampling_watchdog.json")
 BEAT_PATH = os.path.join(STATE_DIR, "sampling_watchdog_beat.json")
 
@@ -350,6 +361,151 @@ def takeover(market, now, dry_run=False):
     return ok, f"{note}｜{'已启动' if ok else '启动失败'} {detail}"
 
 
+# —— 动作三：会话复活（auto 模式专用） ——
+
+def revive_dir():
+    return os.path.join(PROJECT_ROOT, "tmp", "revive")
+
+
+def revive_prompt_path(market, now):
+    return os.path.join(revive_dir(), f"revive_{market}_{now.strftime('%Y%m%d-%H%M%S')}.md")
+
+
+def revive_log_path(market):
+    return os.path.join(revive_dir(), f"revive_{market}.log")
+
+
+def revive_tmux_name(market):
+    return f"pi-revive-{market.lower()}"
+
+
+def revival_prompt(market, gap_sec, now, mode="auto"):
+    """给被拉起的会话的接班指令（写成文件用 `@file` 传，避免长中文的引号转义问题）。"""
+    label = "美股" if market == "US" else "港股"
+    gap_min = max(1, int((gap_sec or 0) // 60))
+    try:
+        from zoneinfo import ZoneInfo
+        et_txt = now.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M")
+        bj_txt = now.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        et_txt = bj_txt = now.strftime("%Y-%m-%d %H:%M")
+    last_et = ""
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        last_et = _dt.fromtimestamp(now.timestamp() - (gap_sec or 0)).astimezone(
+            ZoneInfo("America/New_York")).strftime("%m-%d %H:%M")
+    except Exception:
+        pass
+    takeover_log = takeover_log_path(market)
+    return f"""【外部看护自动接班 · T202HKUS】
+
+原 auto 盯盘会话已失效，由看护拉起本会话接管这一场盯盘。请按下面顺序执行，不要凭记忆假设原会话做过什么。
+
+## 看护检测到的事实
+
+- 市场：{label}（{market}）
+- 链路断开：最后一份采样在美东 {last_et or "未记录"}（距检测时刻约 {gap_min} 分钟），采样段进程不在
+- 唤醒请求已投递到原会话信箱并等待 {WAKE_RECLAIM_SECONDS // 60} 分钟，未被消费 → 判定原会话已死 / 不再产生回合
+- 检测时刻：美东 {et_txt} = 北京 {bj_txt}
+
+## 你必须先做的事（顺序固定）
+
+1. 重建上下文（不靠记忆，靠文件）：
+   `python3 .pi/skills/trade/scripts/preflight.py --mode auto`
+2. 时间与账户对齐：
+   `python3 .pi/skills/trade/scripts/resume.py --mode auto`
+3. 账户实持与止损核对（最重要）：
+   `python3 .pi/skills/trade/scripts/account_status.py`
+   - 账户**有任何持仓** → 先确认每笔持仓都有活动止损腿；缺止损腿的，按 trade skill 的止损保护流程**只补止损**（不得加仓、不得反手）。
+   - 账户**空仓** → 不做任何补挂（2026-11-20 的「空仓补挂止损腿 → 凭空开出空头」事故就是这么来的）。
+
+## 然后继续盯盘
+
+4. 立刻起密采样段继续盯（40 秒一段，靠段结束通知驱动下一段）：
+   用 `background_run` 起 `monitor_segment.py`（或逐笔源稳定后的 `futu_ws_segment.py`），标的与关键位按本场最后一份 actions 记录 / 最后一份 monitor_log 的文件名恢复。
+5. 按 `trade` skill 的 **auto 模式**继续盯盘与执行；三条闸（单持仓互斥 / 连败闸 / 熔断）照常生效，不因「接班」而放宽。
+6. 不要重复开仓：一切以账户实持与 actions 记录为准；本场此前的盈亏与连败计数继续沿用（不要清零）。
+
+## 边界
+
+- 若已到停盯边界（收盘 / 用户已喊停 / 无交易价值）→ 走停盯收尾（`stop_summary` → `keepawake_off` → `monitor_unregister`），并在停盯总结里写明「本场由看护自动接班，中间有一段无分析」。
+- 看护可能在本会话起来之前代跑过几段采样，痕迹在 `{takeover_log}`，那些数据没有分析，需要的话补看。
+"""
+
+
+def revival_command(market, now, prompt_path):
+    """构建复活命令（不执行）：返回 (shell_cmd, tmux_session, log_path)。"""
+    tmux_name = revive_tmux_name(market)
+    log_path = revive_log_path(market)
+    args = [PI_BIN, "-n", f"Victor-revive-{market.lower()}", "-a", f"@{prompt_path}",
+            "按上面的接班指令执行：先核对持仓与止损腿，再立刻起采样段继续 auto 盯盘。"]
+    model = os.environ.get("SAMPLING_WATCHDOG_MODEL")
+    if model:
+        args += ["--model", model]
+    quoted = " ".join(_shell_quote(a) for a in args)
+    return f"{quoted} >> {_shell_quote(log_path)} 2>&1", tmux_name, log_path
+
+
+def allow_revive(market, now, state):
+    """复活节流：同市场 10 分钟一次、每交易日最多 3 次、拉起后 3 分钟内不重拉。"""
+    day = market_date_of(market, now)
+    cell = (state.get("revives") or {}).get(market) or {}
+    last = float(cell.get("last_ts") or 0)
+    if last and now.timestamp() - last < REVIVE_MIN_INTERVAL_SECONDS:
+        return False, f"距上次拉起不足 {REVIVE_MIN_INTERVAL_SECONDS // 60} 分钟"
+    if cell.get("date") == day and int(cell.get("count") or 0) >= MAX_REVIVES_PER_DAY:
+        return False, f"本交易日已拉起 {cell.get('count')} 次（上限 {MAX_REVIVES_PER_DAY}）"
+    return True, "可拉起"
+
+
+def record_revive(market, now, state, ok, detail=""):
+    day = market_date_of(market, now)
+    cell = (state.get("revives") or {}).get(market) or {}
+    if cell.get("date") != day:
+        cell = {"date": day, "count": 0, "failed": 0}
+    cell["count"] = int(cell.get("count") or 0) + 1
+    if not ok:
+        cell["failed"] = int(cell.get("failed") or 0) + 1
+    cell["last_ts"] = now.timestamp()
+    cell["last_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    cell["last_ok"] = bool(ok)
+    cell["last_detail"] = detail[:200]
+    state.setdefault("revives", {})[market] = cell
+    save_state(state)
+
+
+def revive_session(market, gap_sec, now, dry_run=False):
+    """拉起一个自动接班的 auto 盯盘会话。返回 (是否成功, 说明)。"""
+    if not os.path.isfile(PI_BIN):
+        return False, f"找不到 pi 可执行文件（{PI_BIN}）"
+    prompt_path = revive_prompt_path(market, now)
+    cmd, tmux_name, log_path = revival_command(market, now, prompt_path)
+    if dry_run:
+        return True, f"dry-run 未执行：{cmd}"
+    try:
+        os.makedirs(revive_dir(), exist_ok=True)
+        with open(prompt_path, "w", encoding="utf-8") as fh:
+            fh.write(revival_prompt(market, gap_sec, now))
+    except OSError as exc:
+        return False, f"写接班指令失败：{exc}"
+    try:
+        subprocess.run(["tmux", "kill-session", "-t", tmux_name],
+                       capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", tmux_name, "-c", PROJECT_ROOT, cmd],
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception as exc:
+        return False, f"tmux 启动失败：{exc}"
+    if res.returncode != 0:
+        return False, ((res.stdout or "") + (res.stderr or "")).strip()[:200]
+    return True, f"已拉起 pi 会话（tmux: {tmux_name}，指令: {prompt_path}，日志: {log_path}）"
+
+
 # —— 节流 ——
 
 def allow_wake(market, now, state):
@@ -382,6 +538,14 @@ def wake_recent(market, now, state):
     cell = (state.get("wakes") or {}).get(market) or {}
     last = float(cell.get("last_ts") or 0)
     return bool(last) and (now.timestamp() - last) < WAKE_RECLAIM_SECONDS
+
+
+def revive_recent(market, now, state, seconds=None):
+    """最近一次拉起是否还在启动宽限内（期间不接管，避免与新会话的采样段抢行情连接）。"""
+    seconds = REVIVE_BOOT_GRACE_SECONDS if seconds is None else seconds
+    cell = (state.get("revives") or {}).get(market) or {}
+    last = float(cell.get("last_ts") or 0)
+    return bool(last) and (now.timestamp() - last) < seconds
 
 
 def allow_takeover(market, now, state):
@@ -422,9 +586,13 @@ def describe(market, now):
     sessions = market_sessions(market, now)
     argv, _tmux, _log = takeover_command(market, now)
     plan = ("可接管：<" + " ".join(argv) + ">" if argv else "没有可接管标的")
+    logs = collect_logs(market, now)
+    mode = logs[0][2] if logs else "未知"
     return (f"{market}：段进程不在、最后一份日志 "
-            f"{'无' if age is None else str(int(age)) + ' 秒前'} → 应恢复"
-            f"｜可投递信箱的会话 {len(sessions)} 个｜{plan}")
+            f"{'无' if age is None else str(int(age)) + ' 秒前'}｜模式 {mode}"
+            f"｜可投递信箱的会话 {len(sessions)} 个"
+            f"｜{'auto：叫不醒则拉起接班会话' if mode == 'auto' else '（非 auto，不复活）'}"
+            f"｜{plan}")
 
 
 def main():
@@ -452,6 +620,7 @@ def main():
         state = load_state()
         print(f"  投递记录：{json.dumps(state.get('wakes') or {}, ensure_ascii=False)}")
         print(f"  接管记录：{json.dumps(state.get('takeovers') or {}, ensure_ascii=False)}")
+        print(f"  复活记录：{json.dumps(state.get('revives') or {}, ensure_ascii=False)}")
         pend = pending_wake_requests(market, now) if market else []
         print(f"  未认领的唤醒请求：{[p for p, _a in pend]}")
         return 0
@@ -473,30 +642,61 @@ def main():
 
     state = load_state()
     sessions = market_sessions(market, now)[:2]
+    logs = collect_logs(market, now)
+    newest_mode = logs[0][2] if logs else ""
 
-    # ① 有会话在盯过这个市场 → 往它的信箱投唤醒请求（给 300 秒认领时间，期间不接管）
+    # ① 先判「上次唤醒请求有没有被认领」——这一步必须在重新投递之前判，
+    #    否则每 10 分钟冷却到期就重投一次、然后继续等 300 秒，永远走不到复活
+    #    （2026-11-23 改：投递冷却 600 秒 > 认领窗口 300 秒，顺序错了会互相抵消）。
+    pend = pending_wake_requests(market, now)
+    oldest_pending = max((a for _p, a in pend), default=0)
+    _wake_cell = (state.get("wakes") or {}).get(market) or {}
+    _last_wake = float(_wake_cell.get("last_ts") or 0)
+    if not sessions:
+        dead = True                      # 本场没有任何会话映射 → 没人可叫
+    elif not _last_wake:
+        dead = False                     # 还没投递过 → 先投一次（首轮不能直接判死）
+    elif pend and oldest_pending >= WAKE_RECLAIM_SECONDS:
+        dead = True                      # 请求躺在信箱超过认领窗口 → 会话没消费 = 已死
+    elif not pend and (now.timestamp() - _last_wake) >= WAKE_RECLAIM_SECONDS:
+        dead = True                      # 请求被消费过、链却仍断 → 会话醒了但没恢复
+    else:
+        dead = False
+
+    # ② 还没到「判死」→ 投递/续等唤醒请求（项目内文件信箱）
     delivered = []
-    if sessions:
-        if args.force:
-            ok_wake = True
-        else:
-            ok_wake, _why = allow_wake(market, now, state)
+    if not dead:
+        ok_wake = True if args.force else allow_wake(market, now, state)[0]
         if ok_wake:
             for entry in sessions:
                 ok, path = write_wake_request(entry, market, age or 0, now, dry_run=args.dry_run)
                 delivered.append((entry[1], ok, path))
             if not args.dry_run and any(d[1] for d in delivered):
                 record_wake(market, now, state)
-        elif wake_recent(market, now, state):
-            pass
-
-    if sessions and wake_recent(market, now, state):
         print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
               f"断 {int(age or 0)} 秒｜投递唤醒请求：{delivered or '（冷却中，本轮不重复投递）'}"
-              f"｜接管 — 等会话认领（{WAKE_RECLAIM_SECONDS} 秒窗口）")
+              f"｜等会话认领（认领窗口 {WAKE_RECLAIM_SECONDS} 秒）")
         return 0
 
-    # ② 没有会话、或投递后仍没人认领 → 自己接管
+    # ③ 判定已死 → auto 模式拉起接班会话（signal 模式已不再维护，不做复活）
+    if newest_mode == "auto":
+        ok_rev, why_rev = (True, "force") if args.force else allow_revive(market, now, state)
+        if ok_rev:
+            ok, detail = revive_session(market, age or 0, now, dry_run=args.dry_run)
+            if not args.dry_run:
+                record_revive(market, now, state, ok, detail)
+            print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
+                  f"断 {int(age or 0)} 秒｜复活 {'✅' if ok else '❌'} {detail[:200]}")
+            if ok:
+                return 0
+        # 节流中 / 拉起失败 → 落到下面的接管兜底
+
+    # ④ 兜底：复活不可用 / 刚拉起还在启动中 / 非 auto 模式 → 自己起段保数据
+    if revive_recent(market, now, state) and not args.force:
+        print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
+              f"断 {int(age or 0)} 秒｜等待新拉起的会话启动（{REVIVE_BOOT_GRACE_SECONDS} 秒宽限）")
+        return 0
+
     if args.force:
         took, take_detail = takeover(market, now, dry_run=args.dry_run)
     else:
@@ -510,7 +710,7 @@ def main():
 
     print(f"[sampling-watchdog] {now.strftime('%Y-%m-%d %H:%M:%S')}｜{market}｜"
           f"断 {int(age or 0)} 秒｜投递唤醒请求：{delivered or '（无会话可投）'}"
-          f"｜接管 {'✅' if took else '—'} {take_detail[:160]}")
+          f"｜模式 {newest_mode or '未知'}｜接管 {'✅' if took else '—'} {take_detail[:160]}")
     return 0
 
 
