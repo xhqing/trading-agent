@@ -1,3 +1,15 @@
+## [Unreleased]
+
+### 修复（补齐 2026-10-11 变更点内容 + 新增 `decision_source` 维度：换模型也会改变样本分布，2026-11-23 用户确认，T210HKUS）
+
+- **为什么改**：首版把 2026-10-11 登记为「用户标定、具体改动待确认」的占位（当日 CHANGELOG 只见基础设施改动）。用户指出真实内容是——**这一天之后开始做美股模拟盘实验，并把主力模型改为 deepseek-flash（此前并非固定用该模型）**。这暴露了首版 `affects` 分类的一个缺口：它只覆盖「门槛 / 口径 / 仓位 / 纳入 / 盯盘」，没有覆盖「**谁在做决策**」。换模型不改任何明文门槛，却会改变同样行情下会不会开、开多大、何时走。
+- **改了什么**：
+  1. `reviews/change-tags.json` 的 2026-10-11 条目：`title` 改为「美股模拟盘实验开始 + 主力模型改用 deepseek-flash」，`scope` 收窄为 `US`，`affects` = `sample_selection` + `position_size` + 新增的 `decision_source`，`why` 写清三个维度（市场/账户从港股实盘转美股模拟、模拟买力上限压低股数抬高费占 R、模型换人对判断风格的影响），`verified` 置真。
+  2. `change_tags.py` 新增 `decision_source`（「决策来源（模型 / 宿主 / prompt 变更）」）并同步 docstring 的判据说明。
+  3. `SKILL.md` / `AGENTS.md` / `references/review-and-evaluation.md` 三处「affects 六类」同步为**七类**，并补一段「为什么有 `decision_source` 这一类」——它只能靠人提出，是最容易被漏掉的一维。
+- **回归风险**：无。只改数据文件内容与文档表述、新增一个合法取值；`affects` 的校验仍是白名单，旧数据不变。
+- **验证**：`change_tags.py check` 通过（7 个、七类取值合法）；`tmp/verify_t209_tags.py` 6/6 复跑通过。
+
 ## [0.13.0] - 2026-11-23
 
 ### 新增（复盘数据变更点 change tag：重大改动打时间戳，复盘强制提醒样本不可比，2026-11-23 用户立，T209HKUS）

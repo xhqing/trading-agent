@@ -12,6 +12,9 @@
   - `position_size`：单笔仓位规模变化（B / 买力 / 降档规则）
   - `inclusion`：样本纳入范围变化（异常样本排除、补记规则等）
   - `monitoring`：盯盘连续性变化（采样断链、看护、会话复活 → 漏单多少）
+  - `decision_source`：决策产出者变化（换模型、换宿主、prompt/规则大改 → 判断风格可能变）
+     —— 2026-11-23 补：用户指出 10-11 起主力模型改用 deepseek-flash，这类改动不改变
+     门槛/口径，却会改变「AI 怎么判断入场与平仓」，同样是样本分布的一个维度
 
 数据文件：项目根 `reviews/change-tags.json`（入库、可追溯）。复盘脚本
 （`review.py` / `auto_review.py`）读它并在报告里强制显示提醒块。
@@ -47,6 +50,7 @@ AFFECTS = {
     "position_size": "单笔仓位规模（B/买力/降档）",
     "inclusion": "样本纳入范围（异常样本/补记）",
     "monitoring": "盯盘连续性（断链/看护/复活 → 漏单）",
+    "decision_source": "决策来源（模型 / 宿主 / prompt 变更）",
 }
 
 
