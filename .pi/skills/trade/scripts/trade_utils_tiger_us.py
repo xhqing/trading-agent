@@ -566,6 +566,37 @@ def get_open_position_us(config, symbol=None):
         pass
 
 
+def cancel_all_working_orders_us(config, symbol):
+    """撤销该美股标的的**全部工作单**（不只止损单），返回 (n, ids)。
+
+    为什么需要（2026-11-23 实测）：平仓单会被券商拒「The order quantity you entered exceeds
+    your current holdings」——可平额度 = 持仓 − 所有**挂单量**，而 `cancel_all_stop_orders_us`
+    只撤 STP/LOSS/TRAIL 这类止损单。一张残留的 HELD / LMT 普通挂单同样会把额度吃光，于是
+    平仓连试三次全被拒（当晚实测：一张 42.76 的 HELD LMT 挡住三次平仓）。平仓属风控动作，
+    先把本标的的清场做完再平，避免额度死锁。
+    """
+    tc = new_trade_client(config)
+    target = to_tiger_symbol_us(symbol)
+    cancelled = []
+    for order in (tc.get_orders() or []):
+        contract = getattr(order, "contract", None)
+        if str(getattr(contract, "symbol", "") if contract else "") != target:
+            continue
+        oid = getattr(order, "id", None) or getattr(order, "order_id", None)
+        if oid is None:
+            continue
+        status_obj = getattr(order, "status", "")
+        status_val = status_obj.value if hasattr(status_obj, "value") else str(status_obj)
+        if any(s in status_val for s in ("Filled", "Cancelled", "Inactive", "Invalid", "Expired")):
+            continue
+        try:
+            tc.cancel_order(id=oid)
+            cancelled.append(oid)
+        except Exception:
+            continue
+    return len(cancelled), cancelled
+
+
 def cancel_all_stop_orders_us(config, symbol, exclude_order_id=None):
     """撤销指定美股标的的全部未触发止损单（STP/LOSS/TRAIL 等止损类型）。返回 (n, ids)。
 

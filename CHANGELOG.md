@@ -1,3 +1,24 @@
+## [Unreleased]
+
+### 修复（平仓脚本 RTH 外取价取到 stale `last` 导致夜盘 / 盘前平不掉仓 + 平仓前未清场，2026-11-23 实测，T211US）
+
+- **为什么改**：2026-11-23 按用户指示平掉 11-20 遗留的 TQQQ 空头时，`close_position_tiger_us.py` **8 轮全部失败**。两条独立缺陷：
+  1. **取价用 `last`，RTH 之外它是 stale 的**：富途快照在夜盘 / 盘前返回的 `last` 恒为上一交易日收盘（实测 `last=41.20`，而 `bid/ask=42.73/42.76`）；空头回补要 BUY STP（触发价须高于市价），脚本据此把触发价设在 41.20 → 券商连拒 4 次「The trigger price must be higher than the last traded price」。
+  2. **平仓前没清场**：可平额度 = 持仓 − **所有**挂单量，而 `cancel_all_stop_orders_us` 只撤 STP/LOSS/TRAIL。一张残留的 HELD / LMT 普通挂单就把额度吃光 → 后续平仓单被拒「The order quantity you entered exceeds your current holdings」（当晚实测连拒 3 次）。
+- **改了什么**：
+  1. `close_position_tiger_us.py` 新增 `_live_ref_price()`：空头回补取 `ask`、平多取 `bid`、两者都缺才退回 `last`，并把「参考价 + 来源」写进 `rounds`（便于事后判读为何这样取价）。
+  2. 新增 `trade_utils_tiger_us.cancel_all_working_orders_us()`：平仓脚本在进入逼近循环前撤销该标的**全部工作单**（不只止损单），失败不阻断、只打印告警并把已撤 id 写进结果 JSON 的 `pre_close_cancelled_orders`。
+- **回归风险**：低。取价只是把「明显 stale 的来源」换成「活的那一侧」，方向语义与原来一致（止损触发必须穿越当前价）；清场只针对**当前要平的这一个标的**，且原有「平仓后撤残留止损 / 止盈单」逻辑不变。港股版不受影响（港股无盘前 / 夜盘）。
+- **验证**：`py_compile` 通过；实跑 `cancel_all_working_orders_us('US.TQQQ')` 返回 `(0, [])`（当时已无挂单）；取价对照实测 `last=41.20 / bid=45.22 / ask=45.23`，证明 stale 现象真实存在。当晚实际平仓最终走「撤 HELD 单 + BUY LMT @ask」成交（均价 44.94，见 actions 记录与 T203US 归档）。
+
+### 变更（平掉 11-20 遗留的 TQQQ 空头异常仓，用户 2026-11-23 指示）
+
+- 用户指示「现在把模拟盘中未平仓的那笔仓位平掉」，并在问答中选定「现在就平（破例，夜盘执行）」。
+- 结果：`BUY LMT 515 @45.20` 于 **ET 04:04:35 均价 44.94 成交**，净 **−572.64 US$**（开仓费 5.62 + 平仓费 5.62；毛利 −561.40）；平仓后账户无持仓、无残留挂单；动作记入 `actions/2026-11-23-ET-actions-<stag>.md`。
+- 该仓仍按**异常样本**处理（`reviews/review_exclude.json`，不进复盘统计、不计连败闸），并在条目里补注「已于 11-23 平掉」。
+- 定时提醒随之收敛：macmini 计划表里的 `t203us-2-premarket`（北京 17:05）与 `t203us-3-before-open`（北京 22:00）已删除，避免仓位已平后仍收到提醒。
+- **副发现（另立 T212US，未在本次修）**：`auto_equity.py sync` 未把这笔已实现亏损入账（报「新增 0 笔」，账本未反映，具体数值见本机 equity 账本）——`stop_summary.build_trades` 的父子单配对只认「父单 + 子腿」，没有父单的孤儿开仓腿平掉后不入账，导致权益高估约 4.6%。
+
 ## [0.13.1] - 2026-11-23
 
 ### 修复（补齐 2026-10-11 变更点内容 + 新增 `decision_source` 维度：换模型也会改变样本分布，2026-11-23 用户确认，T210HKUS）
