@@ -61,6 +61,28 @@ _today_orders_cache = {}   # query_stop_prices 每轮写入 {账户: 当日订�
 _last_flat_orders_query = 0.0   # 空仓时的查单节流时间戳（2026-10-30 立，T177：空仓最多 45s 查一次）
 
 
+def _held_symbols_any():
+    """查账户全部持仓符号（港美不分，供第四层兜底交叉验证）。查询失败直接抛异常。
+
+    2026-11-23 T213US：同一只老虎账户港美同户，不做市场过滤——兜底告警要的是
+    「这个标的此刻到底有没有仓」，不是分市场统计。
+    """
+    from trade_utils_tiger import load_config, new_trade_client
+    tc = new_trade_client(load_config())
+    out = set()
+    for p in (tc.get_positions() or []):
+        try:
+            q = float(getattr(p, "quantity", 0) or 0)
+        except Exception:
+            continue
+        if q == 0:
+            continue
+        sym = str(getattr(getattr(p, "contract", None), "symbol", "") or "")
+        if sym:
+            out.add(sym)
+    return out
+
+
 def check_position_discipline(orders):
     """第四层兜底检测：白名单外在场敞口 ≥2 → 告警（返回告警字符串或 None）。
 
@@ -79,7 +101,16 @@ def check_position_discipline(orders):
     rp = resident_positions()
     violators = sorted(s for s in exposure if s not in rp)
     if len(violators) >= 2:
-        return violators
+        # 2026-11-23 T213US：告警前用实际持仓交叉验证。当日订单流会把「跨日持仓的平仓腿」
+        # 误算成开仓成交（同日两个标的各平一笔历史仓 → 假双持仓告警，2026-11-23 实录）。
+        # 只在已触及告警阈值时查一次持仓，不增加常规轮次的 API 开销；查询失败保持原告警。
+        try:
+            from trade_mutex import cross_check_exposure
+            violators = sorted(cross_check_exposure(set(violators), _held_symbols_any))
+        except Exception:
+            pass
+        if len(violators) >= 2:
+            return violators
     return None
 
 

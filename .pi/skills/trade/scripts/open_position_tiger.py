@@ -762,7 +762,9 @@ def main():
                                 "blocked_by": "gate_query_failed"})
             print(json.dumps(result_base, ensure_ascii=False))
             sys.exit(1)
-        _gate = mutex.blocked(_gate_orders)
+        # 跨日平仓误判修复（2026-11-23 T213US）：闸门加持仓交叉验证——订单流说敞口但账户
+        # 实际无持仓时判定了结放行；查持仓失败（verify_held 抛异常）时保守维持拦截。
+        _gate = mutex.blocked(_gate_orders, verify_held=lambda: U.held_symbols_tiger(config))
         if _gate is not None:
             # 影子交易路径提示（2026-08-27 立，在场打印）：被拦原因是「别人在场」口径时，
             # AI 应把这笔机会按影子交易落纸面记录（shadow_trade.py open），不丢弃样本。

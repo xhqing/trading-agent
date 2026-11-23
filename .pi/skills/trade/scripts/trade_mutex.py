@@ -284,6 +284,40 @@ def today_open_exposure(orders):
     return {s for s, n in net.items() if n > 0}
 
 
+def _norm_sym(s):
+    """符号归一化：去市场前缀、转大写、去前导零（港股 00700 与 700 视为同一标的）。
+
+    用于「订单流敞口」与「账户实际持仓」的交叉验证（2026-11-23 T213US）。
+    """
+    t = str(s or "").upper().strip()
+    for pre in ("US.", "HK.", "SZ.", "SH."):
+        if t.startswith(pre):
+            t = t[len(pre):]
+    return t.lstrip("0") or t
+
+
+def cross_check_exposure(exposure, verify_held):
+    """用账户实际持仓交叉验证订单流算出的在场敞口（2026-11-23 T213US）。
+
+    **解决的真实缺陷**：跨日持仓在次日平仓时，当日订单流里只有平仓腿（BUY 平空 /
+    SELL 平多），today_open_exposure 会把它当成「开仓成交且无对应平仓」→ 闸门误判
+    在场敞口 → 账户明明空仓却永久拒开（死锁：没有新成交就不会解除误判）。
+    2026-11-23 美股实录：11-20 遗留 TQQQ 空 515 股在当日盘前 04:04 用 BUY 515 平掉，
+    之后整场所有开仓请求都被 blocked_by=open_exposure_today 拦下。
+
+    语义：订单流说某标的有敞口、但账户实际无该标的持仓 → 该敞口已了结，剔除。
+    保守边界：verify_held 抛异常（查不到持仓）时**原样返回**（宁可误拦、不可漏拦）。
+    """
+    if not exposure or verify_held is None:
+        return exposure
+    try:
+        held = {_norm_sym(x) for x in (verify_held() or [])}
+    except Exception as e:  # noqa: BLE001 —— 查持仓任何失败都保守维持拦截
+        print(f"⚠️ 持仓交叉验证失败（保守维持拦截）：{e}", file=sys.stderr)
+        return exposure
+    return {s for s in exposure if _norm_sym(s) in held}
+
+
 def active_open_orders(orders):
     """当日有活动（非终结）的开仓方向挂单（第二层口径 ③：坑已被占，成交只是时间问题）。
 
@@ -343,13 +377,17 @@ class TradeMutex:
             self._fd = None
         return False
 
-    def blocked(self, orders):
+    def blocked(self, orders, verify_held=None):
         """三口径闸门（在锁内调用）。放行返回 None 并写本笔 pending intent；拒开返回
         结构化原因 dict（含 blocked_by 字段，AI 据此继续盯盘不重试）。
 
         orders：当日订单对象列表（get_orders 结果，与成交确认同数据源）。传 None 时
         跳过口径 ②③（查单失败场景——保守起见此时只过口径 ①，由调用方决定是否放行；
         常规调用方应先查单、查不到就拒在更早处）。
+
+        verify_held：可选，无参可调用对象，返回账户当前持仓符号集合。传了就做「订单流
+        敞口 × 实际持仓」交叉验证（跨日平仓误判修复，2026-11-23 T213US），见
+        cross_check_exposure；不传保持原行为。
         """
         # 口径 ①：intent 有未决 pending（崩溃残留）
         pend = pending_intents()
@@ -366,6 +404,9 @@ class TradeMutex:
         orders = _today_orders(orders)
         # 口径 ②：当日订单流有开仓成交且无对应平仓（在场敞口）
         exposure = today_open_exposure(orders)
+        # 跨日持仓次日平仓 → 平仓腿被当成开仓成交的误判修复（2026-11-23 T213US）：
+        # 订单流说敞口、账户实际无持仓 → 判定已了结；查持仓失败则保守维持拦截。
+        exposure = cross_check_exposure(exposure, verify_held)
         if exposure:
             return {"blocked_by": "open_exposure_today",
                     "detail": f"当日已有在场敞口 {sorted(exposure)}（开仓成交且无对应平仓）——"

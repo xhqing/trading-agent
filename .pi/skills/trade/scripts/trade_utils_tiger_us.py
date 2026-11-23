@@ -523,6 +523,28 @@ def get_today_orders_us(config):
     return out
 
 
+def held_symbols_us(config):
+    """返回美股当前持仓的符号集合（裸代码大写），供互斥闸「订单流 × 实际持仓」交叉验证
+    （2026-11-23 T213US，修跨日持仓次日平仓被误判成在场敞口）。
+
+    查询失败直接抛异常——调用方（trade_mutex.cross_check_exposure）会保守维持拦截。
+    """
+    tc = new_trade_client(config)
+    out = set()
+    for p in (tc.get_positions() or []):
+        try:
+            q = float(getattr(p, "quantity", 0) or 0)
+        except Exception:
+            continue
+        if q == 0:
+            continue
+        sym = str(getattr(getattr(p, "contract", None), "symbol", "") or "")
+        if not sym or sym.isdigit():   # 排除港股（5 位数字）
+            continue
+        out.add(sym.upper())
+    return out
+
+
 def get_open_position_us(config, symbol=None):
     """查老虎美股持仓。返回 {'symbol','symbol_name','side','quantity','cost_price'} 或 None。
 
