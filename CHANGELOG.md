@@ -1,3 +1,11 @@
+## [Unreleased]
+
+### 变更（会话角色口径改为 agentLeader / subLeader / Worker 三级）
+
+- **为什么改**：2026-11-25 用户重新定义全团队 Leader / Worker 分工，由「Agent 项目根会话 = Leader、子项目会话 = Worker」的两级改为按「cwd 所在项目 + 当前分支」判定的三级——Agent 项目主工作区 main = agentLeader、子项目主工作区 main = subLeader、任何项目的非 main 分支 worktree = Worker（全局 `~/.pi/agent/AGENTS.md`「Leader / Worker 的定义」节、`~/.pi/agent/docs/agents-registry.md` 第 5 条）。本项目 `AGENTS.md` 里的角色句还停在旧口径。
+- **改了什么**：`AGENTS.md`「子项目清单」节的「智能体专属文件归属」段——角色句按三级重写（trading-agent 主工作区 main = agentLeader，管本项目 + TradingProofs；TradingProofs 主工作区 main = subLeader，只管自身；非 main 分支 worktree = Worker），子项目工作改派给 subLeader 或 Worker 会话，`agent_call` / `agent_wake` 的 `dir` 由「三类目录」改为四类（补上「本项目的 git worktree = Worker」这一形态）。
+- **回归风险**：无。纯文档口径更新，不涉及交易脚本、护栏与配置。
+
 ## [0.13.3] - 2026-11-23
 
 ### 修复（互斥闸把「跨日平仓腿」误判成开仓成交，账户空仓却整场拒开，2026-11-23 实测，T213US）
