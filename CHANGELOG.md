@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+### 变更（交易执行模式默认值：signal → auto，2026-11-25 用户立）
+
+- **为什么改**：2026-11-25 用户下达「现在开始做准备……在开盘的时候自动开始盯盘」，AI 把「自动」读成「自动唤醒」、按旧默认 signal 跑完整场——5 笔信号全部只发信号未下单，券商侧 0 笔真实成交，用户次日才发现。用户裁定：**说「盯盘」就是 auto 模式**，不再要求先明说「自动交易」。
+- **改了什么**：
+  1. `SKILL.md`「模式开关与触发首动作」的模式判定：默认 signal → **默认 auto**；新增两条反误判规则（不得把「自动」解读成自动唤醒而降级；拿不准时按 auto，因为 auto 默认只碰老虎模拟账户、误判代价小）。模式提醒顺序同步（auto 提醒标「默认」、signal 提醒标「用户明说时」）。
+  2. `scripts/trade_utils_tiger.py` 的 `parse_mode()` 默认值三处 `else "signal"` → `else "auto"`（`--mode` / `MODE` 环境变量两条显式来源不变），docstring 记沿革。
+  3. `preflight.py` 模式行加默认值提示（「默认 auto；要 signal 须显式 --mode signal」）——每次启动都在场打印判定依据，不靠 AI 记忆。
+  4. `AGENTS.md` 首段「两种执行模式」句同步改默认值。
+- **工具强制**：默认值落在 `parse_mode()`（代码层，全部脚本生效）+ preflight 每次在场打印（决策时刻提示），不靠 AI 记忆遵守。
+- **回归风险**：中低——默认值反向翻转，旧习惯「不传 --mode 即 signal」的调用会变成 auto（即真下单）。已核实：`grep default="signal"` 全仓无其它遗漏点，`parse_mode([])` 实测返回 `auto`；auto 默认账户 = 老虎模拟账户，实盘仍需用户明说 + AskUserQuestion 二次确认 + 解锁文件三道闸，余额不足或未解锁时下单被拦。**影响边界**：显式传 `--mode signal` 的调用行为不变。
+
+### 数据（2026-11-25 US 场 5 笔信号未执行，按实标注）
+
+- **改了什么**：`signals/2026-11-25-ET-signals.md` 顶部与每条信号标注「用户确认未执行」，避免这 5 笔纸面信号被后续复盘当成真实成交样本。
 ### 变更（会话角色口径改为 agentLeader / subLeader / Worker 三级）
 
 - **为什么改**：2026-11-25 用户重新定义全团队 Leader / Worker 分工，由「Agent 项目根会话 = Leader、子项目会话 = Worker」的两级改为按「cwd 所在项目 + 当前分支」判定的三级——Agent 项目主工作区 main = agentLeader、子项目主工作区 main = subLeader、任何项目的非 main 分支 worktree = Worker（全局 `~/.pi/agent/AGENTS.md`「Leader / Worker 的定义」节、`~/.pi/agent/docs/agents-registry.md` 第 5 条）。本项目 `AGENTS.md` 里的角色句还停在旧口径。
