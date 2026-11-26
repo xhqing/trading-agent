@@ -2754,24 +2754,23 @@ def mark_session_market(market, stag=None):
 
 
 def parse_mode(argv=None):
-    """解析执行模式 --mode（auto / signal），默认 signal（与 trade skill 一致）。
+    """解析执行模式 --mode（auto / signal），**默认 auto**（2026-11-25 用户立）。
 
-    优先级：--mode 参数 > MODE 环境变量 > 默认 signal。环境变量分支 2026-08-21 补——
-    ws_segment 2026-08-16 切到 parse_mode 时注释声称「兼容 --mode 与旧 MODE 环境变量两种
-    来源」，但 parse_mode 本体只解析命令行、从未读环境变量，`MODE=auto python3 ws_segment.py
-    …` 实测仍落 signal（当天实录靠会话恰好用 futu_ws_segment（只认环境变量）才没出事）。
-    三采样脚本（monitor / ws / futu_ws）现统一走本函数，两种来源都认、行为一致。"""
+    优先级：--mode 参数 > MODE 环境变量 > 默认 auto。默认值 2026-11-25 从 signal 改为
+    auto（用户裁定「说盯盘就是 auto」，见 SKILL.md「模式开关与触发首动作」）：旧默认
+    signal 导致 2026-11-25 整场把「开盘自动开始盯盘」读成自动唤醒、5 笔信号全部未下单。
+    环境变量分支 2026-08-21 补：三采样脚本（monitor / ws / futu_ws）统一走本函数。"""
     if argv is None:
         argv = sys.argv[1:]
     for i, a in enumerate(argv):
         if a == "--mode" and i + 1 < len(argv):
             m = argv[i + 1]
-            return m if m in ("auto", "signal") else "signal"
+            return m if m in ("auto", "signal") else "auto"
         if a.startswith("--mode="):
             m = a.split("=", 1)[1]
-            return m if m in ("auto", "signal") else "signal"
+            return m if m in ("auto", "signal") else "auto"
     env_mode = os.environ.get("MODE", "")
-    return env_mode if env_mode in ("auto", "signal") else "signal"
+    return env_mode if env_mode in ("auto", "signal") else "auto"
 
 
 def load_equity(mode='signal', project_root=None, base_currency='HKD', account=None):
